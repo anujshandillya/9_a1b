@@ -138,15 +138,14 @@ Run order: `01_schema_ddl` → `02_indexes` → `03_triggers_and_audit` → `04_
 
 | Collection | Shape |
 |---|---|
-| `menus` | `{_id: uuid-string, restaurant_id: INT 1..100, restaurant_name, categories:[{name, items:[{item_id, name, description, price, available, customization_addons:[{name, price}]}]}], updated_at}` |
-| `reviews` | `{_id, restaurant_id: INT, user_id: uuid-string, rating: 1..5, comment, sentiment_tags:[string], created_at}` |
-| `driverPings` | `{_id, driver_id: INT 1..2000, active: bool, location: GeoJSON Point [lng, lat], created_at}`. Indexes: 2dsphere on `location`, **TTL 7200 s** on `created_at`, and `active`. |
+| `menus` | `{_id: ObjectId, restaurant_id: PG-UUID-string, restaurant_name (= PG name), location: GeoJSON Point of the restaurant, categories:[{name, items:[{item_id, name, description, price, available, customization_addons?:[{name, price}], dietary_tags?:[…]}]}], updated_at}`. One per PG restaurant (200). |
+| `reviews` | `{_id: ObjectId, restaurant_id: PG-UUID-string, user_id: PG-UUID-string, rating: 1..5, comment, sentiment_tags:[string], created_at}`. 110,000 docs over the past 365 days. |
+| `driverPings` | `{_id: ObjectId, driver_id: INT 1..2000, active: bool, location: GeoJSON Point [lng, lat], created_at}`. 510,000 docs in Hyderabad, created within 10 min of seeding, so **they all expire ~2 h after seeding**. Indexes: 2dsphere on `location`, **TTL 7200 s** on `created_at`, and `active`. |
 | `mongo/02_workflow3_geonear.js` | `$geoNear` around a fixed point (Hyderabad 17.3850, 78.4867), `maxDistance 5000`, `active: true`, top 10. |
 | `mongo/03_workflow4_facet.js` | `$match restaurant_id` → `$facet {rating_distribution, most_frequent_tags, overall_average_rating}`. |
 
-⚠️ **Known cross-DB mismatch (see §8):** Postgres restaurant IDs are UUIDs, but Mongo uses ints
-`1..100`. Until this is fixed, the API **cannot** link a Postgres restaurant to its Mongo
-menu/reviews. Don't build around the ints. Wait for Aditya's fix.
+✅ **Cross-DB key fixed (2026-10-14):** Mongo `restaurant_id` / `user_id` are now the Postgres UUIDs as strings.
+So `db.menus.findOne({restaurant_id: pgId})` and `db.reviews.find({restaurant_id: pgId})` just work.
 
 ### 5.3 Planned DB additions for the UI (Aditya will confirm in §9)
 
@@ -160,6 +159,33 @@ These are things the UI spec needs that the inherited DB does not provide yet:
 - **Seed data with spread-out dates and some active orders** (see §8).
 
 ### 5.4 Data-generation handoff (Aditya → Vedant)
+
+**Current way to seed (works now; tested 2026-10-14, about 15 s total):**
+
+```bash
+cp .env.example .env            # then edit PGUSER/PGPASSWORD for your machine
+python3 -m venv data_generation/.venv && data_generation/.venv/bin/pip install -r data_generation/requirements.txt
+createdb bitestream
+for f in sql/0[1-5]*.sql; do psql -v ON_ERROR_STOP=1 -d bitestream -f "$f"; done
+mongosh mongo/01_collections_and_indexes.js          # drops + recreates Mongo collections and indexes
+cd data_generation
+.venv/bin/python postgres_seeder.py --clear          # MUST run first (Mongo seeders read PG ids)
+.venv/bin/python mongo_seeder.py                     # driverPings; re-run if pings expired (2 h TTL)
+.venv/bin/python reviews_seeder.py
+.venv/bin/python menus_seeder.py
+```
+
+**Demo fixtures (fixed IDs, same on every machine):**
+
+| Fixture | ID | State after seeding |
+|---|---|---|
+| Demo Restaurant (Charminar) | `00000000-0000-4000-8000-0000000000a1` | 17.3616, 78.4747; has a menu, ~550 reviews, drivers within 5 km |
+| Demo User (Rich Wallet) | `00000000-0000-4000-8000-000000000001` | about ₹44.6k, no active order, so checkout succeeds |
+| Demo User (Low Balance) | `00000000-0000-4000-8000-000000000002` | **₹45.00**, so checkout fails with *insufficient balance* (`P0001`) |
+| Demo User (Active Order) | `00000000-0000-4000-8000-000000000003` | has a **PREPARING** order, so checkout fails with *active order* (`23505`) |
+
+**Expected counts (default flags):** users 5,000 · restaurants 200 · orders 100,300 (100,000 DELIVERED + 300 live, about 188 PREPARING / 112 DELIVERING) · wallet_audit_logs 129,966 (29,666 CREDIT / 100,300 DEBIT) · orders span ~121 days · menus 200 · reviews 110,000 · driverPings 510,000 (until they expire).
+
 
 Vedant generates data **on his own machine** with our scripts. Aditya's job is to make sure that
 produces a **correct, complete and reproducible** dataset. Aditya delivers:
@@ -247,41 +273,58 @@ Design deliverables: users + goals, wireframes, consistent colours/fonts/compone
 
 ---
 
-## 8. DB verification checklist (Aditya), with suspected issues
+## 8. DB verification checklist (Aditya): baseline results
 
-Status legend: ⬜ not checked · 🔍 suspected from reading code (not yet run) · ✅ verified OK · ❌ confirmed broken · 🔧 fixed
+Status legend: ✅ verified OK · ⚠️ works but deviates / caveat · ❌ confirmed broken · 🔧 fixed (updated as fixes land)
+
+### 8.0 Baseline run of the inherited code, unmodified (2026-10-14)
+
+**Environment:** PostgreSQL **18.6** (Homebrew, local), MongoDB **8.0.34** (official tarball in `~/mongodb-8.0`), Python 3.14 venv, psycopg2 2.9.13, pymongo 4.18.3. No Docker.
+**Throwaway DBs:** Postgres `bitestream_inherited`, Mongo `bitestream`.
+
+| Step | Result |
+|---|---|
+| `sql/01..05` on an empty DB | ✅ All apply cleanly. ✅ All five are **re-runnable** (applied twice, no errors). |
+| `postgres_seeder.py` (env `PGUSER/PGDATABASE`) | ✅ Exit 0 in **86 s**: 1,000 users, 100 restaurants, **200,000 orders**, **200,000 audit rows**. |
+| `mongo/01_collections_and_indexes.js` | ✅ Creates 3 collections + all indexes (2dsphere, TTL 7200 s, etc.). |
+| `mongo_seeder.py` | ✅ Exit 0 in **7 s**: 100 menus, 50,000 reviews, 500,000 pings, **then the TTL deleted 251,609 pings within ~1 min → 248,391 left**. |
+| `mongo/02_workflow3_geonear.js` | ✅ Runs, uses the 2dsphere index (no COLLSCAN). 23,691 pings within 5 km, from 2,000 drivers, up to 27 pings per driver. |
+| `mongo/03_workflow4_facet.js` | ✅ Runs, uses `idx_reviews_restaurant` (no COLLSCAN). 480 reviews for restaurant 1, avg 3.06. |
+| `sql/06_window_analytics.sql` | ✅ Runs in **113 ms** (Bitmap Index Scan on `idx_orders_status_created_at`). ❌ Only **100 of 9,000** day-rows are non-zero (see 8.2 #1). |
+| Audit-trail query (`WHERE user_id=… ORDER BY timestamp DESC LIMIT 50`) | ✅ 0.1 ms, Index Scan on `idx_wallet_audit_user_timestamp`. |
 
 ### 8.1 Against the A1 BiteStream spec
 
-| # | Requirement (A1 spec) | Where | Status / note |
+| # | Requirement (A1 spec) | Where | Status / evidence |
 |---|---|---|---|
-| 1 | `users.wallet_balance DECIMAL(10,2) CHECK >= 0` | `sql/01_schema_ddl.sql:7-13` | ⬜ looks right |
-| 2 | `wallet_audit_logs` fields + `timestamp DEFAULT NOW()` | `sql/01_schema_ddl.sql:44-60` | ⬜ looks right |
-| 3 | `restaurants`, `orders` (status enum, FKs) | `sql/01_schema_ddl.sql:15-42` | ⬜ looks right |
-| 4 | Trigger AFTER UPDATE OF wallet_balance → immutable audit | `sql/03_triggers_and_audit.sql` | ⬜ looks right (+ immutability trigger) |
-| 5 | Partial unique index `idx_active_user_order` | `sql/02_indexes.sql:6-8` | ⬜ matches spec exactly |
-| 6 | MV **joining restaurants** with **total completed order count and revenue** + REFRESH CONCURRENTLY fn | `sql/05_materialized_views.sql` | 🔍 MV is **per-day** and **doesn't JOIN restaurants** (no name). Created `WITH NO DATA`, so the first CONCURRENTLY refresh fails until a plain refresh is run. No last-refreshed tracking. |
-| 7 | 2dsphere on `DriverPings.location`, TTL 7200 on `created_at` | `mongo/01_collections_and_indexes.js` | ⬜ looks right. Note: script **drops** collections, so run it *before* seeding. |
-| 8 | WF1 `sp_execute_checkout`: **starts a REPEATABLE READ txn**, debits, inserts order, **COMMIT**; **catch** insufficient-balance and **ROLLBACK** | `sql/04_stored_procedures.sql` | 🔍 Procedure **doesn't control the transaction** (relies on the caller) and **doesn't catch/rollback**. It pre-checks balance instead of relying on the CHECK constraint. Doesn't return the new order id. Decide: fix in-proc, or document the caller contract. |
-| 9 | WF2 CTE + window: 7-day moving avg per restaurant + DENSE_RANK | `sql/06_window_analytics.sql` | 🔍 Query logic looks sound (calendarized, ROWS 6 PRECEDING). **But see 8.2 #1:** seeded dates make it meaningless. |
-| 10 | WF3 `$geoNear` closest **active driver** within 5 km **of a restaurant** | `mongo/02_workflow3_geonear.js` | 🔍 Hardcoded point, not a real restaurant. Returns **pings, not distinct drivers** (same driver can appear many times). Doesn't filter stale pings. |
-| 11 | WF4 `$facet`: rating dist, top tags via `$unwind`, avg | `mongo/03_workflow4_facet.js` | ⬜ looks right. Uses int `restaurant_id = 1`. |
-| 12 | ≥100k audit rows, ≥50k orders | `data_generation/postgres_seeder.py` | 🔍 Targets 200k orders → 200k DEBIT audits, but one order per round-trip with `ORDER BY random()` (very slow). Verify the actual counts. |
-| 13 | ≥500k geo pings | `data_generation/mongo_seeder.py` | 🔍 Pings are timestamped 0–240 min ago, and the TTL is 120 min, so **about half are deleted within ~1 min**, and **all are gone after 2 h**. Count will be < 500k. |
-| 14 | ERD, mongo schema map, EXPLAIN / executionStats in README / `performance/` | — | 🔍 **Missing** from the inherited repo. |
+| 1 | `users.wallet_balance DECIMAL(10,2) CHECK >= 0` | `sql/01_schema_ddl.sql:7-13` | ✅ |
+| 2 | `wallet_audit_logs` fields + `timestamp DEFAULT NOW()` | `sql/01_schema_ddl.sql:44-60` | ✅ |
+| 3 | `restaurants`, `orders` (status enum, FKs) | `sql/01_schema_ddl.sql:15-42` | ✅ The status CHECK rejects `'CANCELLED'`. |
+| 4 | Trigger AFTER UPDATE OF wallet_balance → immutable audit | `sql/03_triggers_and_audit.sql` | ✅ The DEBIT row is written on checkout, and the CREDIT row on a manual top-up. ✅ UPDATE/DELETE on the audit log are rejected. ⚠️ `TRUNCATE` bypasses immutability (row triggers don't fire). ⚠️ INSERTs into `users` don't log the opening balance. |
+| 5 | Partial unique index `idx_active_user_order` | `sql/02_indexes.sql:6-8` | ✅ A second active order fails with `23505`, and the debit is rolled back with the statement. |
+| 6 | MV **joining restaurants** with **total completed order count and revenue** + REFRESH CONCURRENTLY fn | `sql/05_materialized_views.sql` | ❌ The MV is **per-day** and **doesn't JOIN restaurants**. 🔧 The seeder now does the first plain refresh, so `fn_refresh_restaurant_daily_revenue()` works after seeding. *(Was: it* **fails on a fresh install** ("CONCURRENTLY cannot be used when the materialized view is not populated"), and the seeder never does the first plain refresh. ✅ After one manual refresh, CONCURRENTLY works. No last-refreshed tracking. |
+| 7 | 2dsphere on `DriverPings.location`, TTL 7200 on `created_at` | `mongo/01_collections_and_indexes.js` | ✅ Both present. Note: the collection is named `driverPings` (camelCase), and the script **drops** collections, so run it *before* seeding. |
+| 8 | WF1 `sp_execute_checkout`: **starts a REPEATABLE READ txn**, debits, inserts order, **COMMIT**; **catch** insufficient-balance and **ROLLBACK** | `sql/04_stored_procedures.sql` | ⚠️ Partly. ✅ Success, plus clear errors: `P0001` insufficient balance, `23505` active order, `22023` amount ≤ 0, `23503` unknown user or restaurant. Balance is unchanged after every failure. ✅ Concurrency is safe: two simultaneous checkouts by one user → one succeeds, the other gets **`40001` serialization failure**. ❌ The procedure **does not start a REPEATABLE READ txn or COMMIT itself** (confirmed: CALL inside an outer txn is undone by the outer ROLLBACK). ❌ It doesn't **catch** anything (errors propagate). It never relies on the CHECK constraint. ❌ It **returns nothing** (no order id). |
+| 9 | WF2 CTE + window: 7-day moving avg per restaurant + DENSE_RANK | `sql/06_window_analytics.sql` | ✅ Query logic is correct (calendarized, `ROWS 6 PRECEDING`, DENSE_RANK). ❌ **Output is meaningless with the seeded data** (8.2 #1). The window is relative to `CURRENT_DATE`, last 90 days. |
+| 10 | WF3 `$geoNear` closest **active driver** within 5 km **of a restaurant** | `mongo/02_workflow3_geonear.js` | ⚠️ Runs and uses the index, but: the point is hardcoded (not a restaurant), it returns **pings, not distinct drivers** (up to 27 pings per driver in range), and it includes stale pings (the top 10 contained pings >2 h old that were about to be purged). |
+| 11 | WF4 `$facet`: rating dist, top tags via `$unwind`, avg | `mongo/03_workflow4_facet.js` | ✅ Correct output and index use. ⚠️ Keyed by int `restaurant_id = 1` (see 8.2 #4). |
+| 12 | ≥100k audit rows, ≥50k orders | `data_generation/postgres_seeder.py` | ✅ 200,000 / 200,000 in 86 s. (My earlier "very slow" guess was wrong.) |
+| 13 | ≥500k geo pings | `data_generation/mongo_seeder.py` | 🔧 **Fixed:** 510,000 inserted, 0 older than 2 h (all expire together ~2 h after seeding; re-run `mongo_seeder.py`). *(Was:* 500,000 inserted, but **50.3% were already older than the 2 h TTL → 248,391 remained after ~1 min**, and all are gone after 2 h. |
+| 14 | ERD, mongo schema map, EXPLAIN / executionStats in README / `performance/` | — | ❌ **Missing** from the inherited repo. (The indexes *are* used, see 8.0.) |
 
 ### 8.2 Data-quality issues that will break the UI
 
-| # | Issue | Where | Impact |
+| # | Issue | Where | Status / evidence |
 |---|---|---|---|
-| 1 | **All orders and audit rows get `created_at = NOW()` at seed time** (the procedure uses the default, and the seeder never backdates). | `postgres_seeder.py`, `04_stored_procedures.sql:68-79` | 7-day moving-average chart = a single spike. The audit date filter is useless. |
-| 2 | **Every seeded order is immediately set to DELIVERED** → zero active orders. No status variety. | `postgres_seeder.py:136-143` | Can't demo the partial index or status transitions without making data by hand. |
-| 3 | **Restaurants are placed randomly across the whole globe** (lat −90..90, lng −180..180), but **driver pings are in Hyderabad**. | `postgres_seeder.py:53-54` vs `mongo_seeder.py:221-229` | `$geoNear` from any real restaurant returns **nothing**. |
-| 4 | **No shared key between Postgres and Mongo**: PG restaurants are UUIDs, Mongo `restaurant_id` is int 1..100. Review `user_id`s are random UUIDs unrelated to PG users. Names differ ("Test Restaurant N" vs "Restaurant N"). | both seeders | The UI can't show a restaurant's menu/reviews. |
-| 5 | Starting balance ₹1,000,000 for all users, and no CREDIT events ever. | `postgres_seeder.py:20` | "Insufficient balance" never happens naturally. The audit trail is all DEBIT. Need some low-balance demo users. |
-| 6 | Default PG password `"2306"` is hardcoded. Seeders aren't idempotent (a rerun duplicates users/restaurants). Seeders aren't seeded with a fixed `random.seed`, so every run produces different data. | `postgres_seeder.py:12` | Vedant's local data won't match anyone else's. Reruns corrupt counts. Move credentials to env vars (§5.5), add a clean reset, and fix the random seed. |
-| 7 | All menu items share the same two add-ons and the same description. | `mongo_seeder.py:110-124` | Cosmetic. "Flexible catalog" isn't very flexible. |
-| 8 | Inherited git history looks squashed into one commit (`bc3cbe5`). The spec says *"Keep the Assignment 1 commit history intact."* | git | Mention it honestly in the handover note. |
+| 1 | **All orders and audit rows get `NOW()` at seed time.** | `postgres_seeder.py`, `04_stored_procedures.sql:68-79` | 🔧 **Fixed:** orders span 121 days, and WF2 has 16,321 of 18,000 non-zero day-rows. *(Was:* all 200,000 orders within **85 seconds on one day**.) Audit rows also span 1 day. The WF2 chart is a single spike. The audit date filter is useless. |
+| 2 | **Every seeded order is immediately set to DELIVERED** | `postgres_seeder.py:136-143` | 🔧 **Fixed:** 300 live orders via `sp_execute_checkout` (about 188 PREPARING / 112 DELIVERING). *(Was: 0 active.)* |
+| 3 | **Restaurants are spread over the whole globe; pings are in Hyderabad** | `postgres_seeder.py:53-54` vs `mongo_seeder.py:221-229` | 🔧 **Fixed:** 200/200 restaurants are in the Hyderabad ping area. *(Was:* **0 of 100** (lat −90..87, lng −177..178). |
+| 4 | **No shared key between Postgres and Mongo** | both seeders | 🔧 **Fixed:** Mongo uses PG UUID strings; 200/200 menu and review restaurant_ids resolve in PG. *(Was:* PG restaurant ids are UUIDs, Mongo `restaurant_id` is a number 1..100. Names differ ("Test Restaurant N" vs "Restaurant N"). Review `user_id`s don't exist in PG. |
+| 5 | ₹1,000,000 starting balance, no CREDIT events | `postgres_seeder.py:20` | 🔧 **Fixed:** realistic balances (median ≈ ₹2.9k), 29,666 CREDIT rows, 179 users under ₹200, plus the ₹45 demo user. *(Was:* final balances ₹996,235–997,677. 0 users can hit "insufficient balance". 100% of audit rows are DEBIT. |
+| 6 | Hardcoded password, not idempotent, no fixed random seed | `postgres_seeder.py:12` | 🔧 **Fixed:** `.env` / CLI args, `--clear`, `--seed 42` (reruns give identical IDs and amounts). *(Was:* confirmed by reading. Works with `PGUSER/PGPASSWORD` env overrides. A rerun would add another 1,000 users and 100 restaurants. |
+| 7 | All menu items share the same two add-ons and description; items are random per category (e.g. "Paneer Tikka" under "Desserts") | `mongo_seeder.py:110-124` | 🔧 **Fixed:** category-specific items and add-ons, optional `dietary_tags`. |
+| 8 | Inherited git history squashed into one commit (`bc3cbe5`) | git | ⚠️ Mention in the handover note. |
+| — | *Good news:* the data is internally consistent | — | ✅ Every DEBIT matches an order. Every user's balance equals their latest `balance_after`. |
 
 ### 8.3 Verification procedure (to run next)
 
@@ -301,6 +344,11 @@ Status legend: ⬜ not checked · 🔍 suspected from reading code (not yet run)
 |---|---|---|---|---|
 | 2026-10-13 | Aditya | `AI.md` | Created | Shared team/AI context |
 | 2026-10-13 | Aditya | `AI.md` | Named roles (Vedant = backend, Anuj = frontend + compose). Sounak not participating. Added §5.4 and §5.5 | Team roles confirmed |
+| 2026-10-14 | Aditya | `AI.md` | §8 filled with baseline run results (no code changed yet) | Step 1 verification |
+| 2026-10-14 | Aditya | `data_generation/postgres_seeder.py` | Rewritten in the structure of the GigTask-P5 seeder (argparse, logging, .env, Faker `en_IN`, `--seed`, `--clear`, batched `execute_values`, MV refresh). Consistent wallet ledger, 120-day spread, Hyderabad restaurants, 300 live orders via `sp_execute_checkout`, demo fixtures. | Fix 8.2 #1–6. Team asked to reuse the GigTask seeders. |
+| 2026-10-14 | Aditya | `data_generation/mongo_seeder.py` | Now seeds **only** driverPings (510k, timestamps within last 10 min) | Fix 8.1 #13 (TTL purge). Mirrors the GigTask split. |
+| 2026-10-14 | Aditya | `data_generation/reviews_seeder.py`, `menus_seeder.py` (new) | Reviews/menus split out; keyed by PG UUIDs; varied ratings/tags/items | Fix 8.2 #4, #7 |
+| 2026-10-14 | Aditya | `data_generation/requirements.txt`, `.env.example` (new) | Added Faker + python-dotenv; env template | Same as GigTask-P5 |
 
 ---
 
