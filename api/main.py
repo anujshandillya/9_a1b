@@ -14,6 +14,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from fastapi import FastAPI, Query, Request
@@ -32,6 +33,9 @@ DRIVER_FRESH_MINUTES = int(os.getenv("DRIVER_FRESH_MINUTES", "30"))
 NEXT_STATUS = {"PREPARING": "DELIVERING", "DELIVERING": "DELIVERED"}
 ORDER_STATUSES = {"PREPARING", "DELIVERING", "DELIVERED"}
 _last_refresh_memory: dict = {"at": None}  # fallback if mv_refresh_log does not exist
+SUMMARY_VIEW = "mv_restaurant_daily_revenue"  # the view /analytics/summary reads
+MAX_AMOUNT = Decimal("99999999.99")  # DECIMAL(10,2): largest order / wallet balance
+DEFAULT_TZ = "Asia/Kolkata"  # fallback for the audit date filter
 
 
 @asynccontextmanager
@@ -122,14 +126,34 @@ def _find_menu(restaurant: dict, mongo_key: Optional[str]):
     return doc
 
 
-def _last_refreshed():
-    try:  # table planned by Aditya (AI.md 5.3); column name: refreshed_at
-        row = db.one("SELECT MAX(refreshed_at) AS t FROM mv_refresh_log")
+def _last_refreshed(view: str = SUMMARY_VIEW):
+    """Latest refresh of a materialized view, from mv_refresh_log (sql/05_materialized_views.sql).
+    Falls back to the time this API process last refreshed, for databases without the log table."""
+    try:
+        row = db.one("SELECT MAX(refreshed_at) AS t FROM mv_refresh_log WHERE view_name = %s", [view])
         if row and row["t"]:
             return row["t"]
     except psycopg.Error:
         pass
     return _last_refresh_memory["at"]
+
+
+def _check_amount(amount: Decimal):
+    """Reject amounts that cannot fit DECIMAL(10,2) before they reach the database."""
+    if amount > MAX_AMOUNT:
+        raise ApiError(400, "AMOUNT_TOO_LARGE", "The amount is too large. The maximum is ₹9,99,99,999.99.")
+
+
+def _resolve_tz(name: Optional[str]):
+    """The caller's time zone (IANA name, e.g. 'Asia/Kolkata'); IST if missing or invalid."""
+    for candidate in (name, DEFAULT_TZ):
+        if not candidate:
+            continue
+        try:
+            return ZoneInfo(candidate), candidate
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+    return timezone(timedelta(hours=5, minutes=30), "IST"), "IST"  # no tz database available
 
 
 def _window_sql() -> str:
@@ -196,6 +220,7 @@ def topup(user_id: UUID, body: TopUp):
     amount = body.amount.quantize(Decimal("0.01"), ROUND_HALF_UP)
     if amount <= 0:
         raise ApiError(400, "INVALID_AMOUNT", "Top-up amount must be greater than zero.")
+    _check_amount(amount)
     with db.pool.connection() as conn:
         row = conn.execute(
             "UPDATE users SET wallet_balance = wallet_balance + %s WHERE id = %s RETURNING id, name, wallet_balance",
@@ -314,45 +339,43 @@ _RETRY_STATES = ("40001", "40P01")
 
 
 def _checkout_once(conn, user_id, restaurant_id, amount):
-    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
-    before = conn.execute("SELECT wallet_balance FROM users WHERE id = %s", [user_id]).fetchone()
-    if before is None:
+    # sp_execute_checkout runs its own REPEATABLE READ transaction (COMMIT / ROLLBACK inside),
+    # so it must be CALLed in autocommit mode, not inside BEGIN ... COMMIT (that raises 2D000).
+    if conn.execute("SELECT 1 FROM users WHERE id = %s", [user_id]).fetchone() is None:
         raise ApiError(404, "USER_NOT_FOUND", "User not found.")
-    conn.execute("CALL sp_execute_checkout(%s, %s, %s)", [user_id, restaurant_id, amount])
+    order_id = conn.execute(
+        "CALL sp_execute_checkout(%s, %s, %s)", [user_id, restaurant_id, amount]
+    ).fetchone()["p_order_id"]
     order = conn.execute(
-        """SELECT id, user_id, restaurant_id, total_amount, status, created_at FROM orders
-           WHERE user_id = %s AND restaurant_id = %s ORDER BY created_at DESC, id LIMIT 1""",
-        [user_id, restaurant_id],
+        "SELECT id, user_id, restaurant_id, total_amount, status, created_at FROM orders WHERE id = %s",
+        [order_id],
     ).fetchone()
+    # The DEBIT row written by the wallet trigger inside the procedure's transaction.
     audit = conn.execute(
-        'SELECT * FROM wallet_audit_logs WHERE user_id = %s ORDER BY "timestamp" DESC, id DESC LIMIT 1',
+        """SELECT * FROM wallet_audit_logs WHERE user_id = %s AND action_type = 'DEBIT'
+           ORDER BY "timestamp" DESC, id DESC LIMIT 1""",
         [user_id],
     ).fetchone()
-    after = conn.execute("SELECT wallet_balance FROM users WHERE id = %s", [user_id]).fetchone()
-    conn.execute("COMMIT")
     return {
         "order": order,
-        "balance_before": before["wallet_balance"],
-        "balance_after": after["wallet_balance"],
+        "balance_before": audit["balance_after"] + audit["amount_changed"],
+        "balance_after": audit["balance_after"],
         "audit_entry": audit,
     }
 
 
 @app.post("/api/checkout")
 def checkout(body: CheckoutRequest):
-    """BEGIN REPEATABLE READ -> CALL sp_execute_checkout -> read results -> COMMIT.
-    Any error => ROLLBACK, and the SQLSTATE is mapped to a friendly message (errors.py)."""
+    """CALL sp_execute_checkout (it owns its REPEATABLE READ transaction) -> read results.
+    Any error => the procedure has rolled back; the SQLSTATE is mapped to a friendly message (errors.py)."""
     amount = body.amount.quantize(Decimal("0.01"), ROUND_HALF_UP)
+    _check_amount(amount)
     for attempt in range(3):
         with db.pool.connection() as conn:
-            conn.autocommit = True  # we control BEGIN/COMMIT/ROLLBACK ourselves
+            conn.autocommit = True  # the procedure does its own COMMIT / ROLLBACK
             try:
                 return _checkout_once(conn, body.user_id, body.restaurant_id, amount)
             except Exception as exc:
-                try:
-                    conn.execute("ROLLBACK")
-                except psycopg.Error:
-                    pass
                 retry = isinstance(exc, psycopg.Error) and exc.sqlstate in _RETRY_STATES
                 if retry and attempt < 2:
                     continue  # concurrent update: try again with a fresh snapshot
@@ -372,17 +395,20 @@ def audit_trail(
     date_to: Optional[date] = Query(None, alias="to"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    tz: Optional[str] = Query(None, max_length=64),
 ):
+    """Dates are whole days in the caller's time zone (?tz=Asia/Kolkata from the browser); IST if not given/invalid."""
+    zone, zone_name = _resolve_tz(tz)
     user = db.one("SELECT id, name, wallet_balance FROM users WHERE id = %s", [user_id])
     if user is None:
         raise ApiError(404, "USER_NOT_FOUND", "User not found.")
     clauses, params = ["user_id = %s"], [user_id]
     if date_from:
         clauses.append('"timestamp" >= %s')
-        params.append(datetime.combine(date_from, datetime.min.time(), tzinfo=timezone.utc))
+        params.append(datetime.combine(date_from, datetime.min.time(), tzinfo=zone))
     if date_to:  # inclusive end date
         clauses.append('"timestamp" < %s')
-        params.append(datetime.combine(date_to + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc))
+        params.append(datetime.combine(date_to + timedelta(days=1), datetime.min.time(), tzinfo=zone))
     where = " AND ".join(clauses)
     totals = db.one(
         f"""SELECT COUNT(*) AS n,
@@ -404,7 +430,7 @@ def audit_trail(
         params + [limit, (page - 1) * limit],
     )
     out = _paged(items, totals["n"], page, limit)
-    out.update(user=user, total_debits=totals["total_debits"], total_credits=totals["total_credits"])
+    out.update(user=user, total_debits=totals["total_debits"], total_credits=totals["total_credits"], timezone=zone_name)
     return out
 
 
@@ -467,11 +493,16 @@ def analytics_summary():
 
 @app.post("/api/analytics/refresh")
 def analytics_refresh():
+    """Refresh both revenue views; each refresh is logged in mv_refresh_log by the database."""
     try:
-        db.run("SELECT fn_refresh_restaurant_daily_revenue()")
-    except (psycopg.errors.FeatureNotSupported, psycopg.errors.ObjectNotInPrerequisiteState):
-        # MV was created WITH NO DATA: CONCURRENTLY needs a first plain refresh.
-        db.run("REFRESH MATERIALIZED VIEW mv_restaurant_daily_revenue")
+        db.run("SELECT fn_refresh_all_revenue_views()")
+    except psycopg.errors.UndefinedFunction:
+        # Older database without sql/05's refresh log: refresh the summary's view directly.
+        try:
+            db.run("SELECT fn_refresh_restaurant_daily_revenue()")
+        except (psycopg.errors.FeatureNotSupported, psycopg.errors.ObjectNotInPrerequisiteState):
+            # MV was created WITH NO DATA: CONCURRENTLY needs a first plain refresh.
+            db.run("REFRESH MATERIALIZED VIEW mv_restaurant_daily_revenue")
     _last_refresh_memory["at"] = datetime.now(timezone.utc)
     return {"last_refreshed": _last_refreshed()}
 

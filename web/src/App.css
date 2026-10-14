@@ -1263,6 +1263,16 @@ main {
   color: var(--muted);
 }
 
+.snapshot-hint {
+  flex-basis: 100%;
+  font-size: 12px;
+}
+
+.form-field small.field-error,
+.topup-form .field-error {
+  color: #9a3e22;
+}
+
 .segmented {
   display: flex;
   gap: 2px;

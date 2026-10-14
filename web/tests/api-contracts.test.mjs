@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apiError, normalizeResponse, validAmount } from '../src/lib/contracts.js'
+import { amountProblem, apiError, browserTimeZone, normalizeResponse, validAmount } from '../src/lib/contracts.js'
 import { request } from '../src/lib/api.js'
 
 test('moving average consumes the API series and date fields', () => {
@@ -106,4 +106,36 @@ test('cancelling a request preserves AbortError', async (t) => {
 test('an empty API list stays empty', async (t) => {
   t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ items: [], total: 0 })))
   assert.deepEqual(await request('/restaurants'), { items: [], total: 0 })
+})
+
+test('amounts that cannot fit DECIMAL(10,2) are rejected in the browser with a reason', () => {
+  assert.equal(amountProblem('420.00'), '')
+  assert.equal(amountProblem('99999999.99'), '')
+  assert.match(amountProblem('100000000'), /too large/)
+  assert.match(amountProblem('99999999999'), /too large/)
+  assert.match(amountProblem('0'), /greater than zero/)
+  assert.match(amountProblem('12.345'), /two decimal places/)
+  assert.match(amountProblem(''), /Enter an amount/)
+})
+
+test('a top-up is rejected when the new wallet balance would exceed the limit', () => {
+  assert.equal(amountProblem('500', { balance: '1000.00' }), '')
+  assert.equal(amountProblem('0.01', { balance: '99999999.98' }), '')
+  assert.match(amountProblem('0.02', { balance: '99999999.98' }), /above the/)
+  assert.match(amountProblem('95000000', { balance: '10000000.00' }), /above the/)
+})
+
+test('checkout never pre-checks the wallet balance (the database must report insufficient funds)', () => {
+  assert.equal(amountProblem('5000'), '')
+})
+
+test('AMOUNT_TOO_LARGE and SQLSTATE 22003 map to a friendly message', () => {
+  assert.match(apiError({ error_code: 'AMOUNT_TOO_LARGE', message: 'x' }).message, /too large/)
+  assert.match(apiError({ sqlstate: '22003', message: 'numeric field overflow' }).message, /too large/)
+})
+
+test('the browser time zone is an IANA name (or empty, so the API falls back to IST)', () => {
+  const zone = browserTimeZone()
+  assert.equal(typeof zone, 'string')
+  if (zone) assert.doesNotThrow(() => new Intl.DateTimeFormat('en', { timeZone: zone }))
 })
