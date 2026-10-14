@@ -80,6 +80,18 @@ function series(state, id) {
 export function demoRequest(state, path, method = 'GET', body) {
   const url = new URL(path, 'http://demo.local'), p = Object.fromEntries(url.searchParams), route = url.pathname.replace(/^\/api/, '')
   const decorated = (order) => ({ ...order, user_name: state.users.find((u) => u.id === order.user_id)?.name, restaurant_name: state.restaurants.find((r) => r.id === order.restaurant_id)?.name })
+  if (route === '/health') return { status: 'ok', postgres: true, mongo: true }
+  const topup = route.match(/^\/users\/([^/]+)\/topup$/)
+  if (topup && method === 'POST') {
+    const user = state.users.find((row) => row.id === topup[1])
+    if (!user) fail('NOT_FOUND', 'Customer not found.')
+    const amount = Number(body?.amount)
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 99999999.99 || round(amount) !== amount) fail('INVALID_AMOUNT', 'Enter a valid positive amount.')
+    const audit_entry = { id: globalThis.crypto.randomUUID(), user_id: user.id, action_type: 'CREDIT', amount_changed: amount, balance_after: round(user.wallet_balance + amount), timestamp: new Date().toISOString() }
+    user.wallet_balance = audit_entry.balance_after
+    state.audit.push(audit_entry)
+    return { user: { ...user }, audit_entry }
+  }
   if (route === '/checkout' && method === 'POST') return checkout(state, body)
   if (/^\/orders\/[^/]+\/advance$/.test(route) && method === 'POST') return advance(state, route.split('/')[2])
   if (route === '/analytics/summary') return { ...state.snapshot, last_refreshed: state.last_refreshed }

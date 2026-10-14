@@ -1,5 +1,6 @@
+import { RestaurantSelect } from '../components/EntityPicker'
 import { useState } from 'react'
-import { Icon, Notice, PageHeader, Panel, ResourceState, RestaurantSelect } from '../components/ui'
+import { Icon, Notice, PageHeader, Panel, ResourceState } from '../components/ui'
 import { itemsOf, query } from '../lib/api'
 import { dateTime } from '../lib/format'
 import { useResource } from '../lib/hooks'
@@ -7,8 +8,18 @@ import { useResource } from '../lib/hooks'
 function DriverMap({ drivers, origin, selected, setSelected, onOrigin }) {
   const [zoom, setZoom] = useState(1)
   const W = 900, H = 600, metersPerPixel = 20 / zoom
-  const toPoint = (coordinates) => [W / 2 + (coordinates[0] - origin.lng) * 111320 * Math.cos(origin.lat * Math.PI / 180) / metersPerPixel, H / 2 - (coordinates[1] - origin.lat) * 111320 / metersPerPixel]
-  function selectOrigin(event) { const rect = event.currentTarget.getBoundingClientRect(); const x = (event.clientX - rect.left) / rect.width * W, y = (event.clientY - rect.top) / rect.height * H; onOrigin({ lat: origin.lat - (y - H / 2) * metersPerPixel / 111320, lng: origin.lng + (x - W / 2) * metersPerPixel / (111320 * Math.cos(origin.lat * Math.PI / 180)) }) }
+  const longitudeScale = Math.max(0.0001, Math.cos(origin.lat * Math.PI / 180))
+  const toPoint = (coordinates) => [W / 2 + (coordinates[0] - origin.lng) * 111320 * longitudeScale / metersPerPixel, H / 2 - (coordinates[1] - origin.lat) * 111320 / metersPerPixel]
+  function selectOrigin(event) {
+    const matrix = event.currentTarget.getScreenCTM()
+    if (!matrix) return
+    const point = event.currentTarget.createSVGPoint()
+    point.x = event.clientX; point.y = event.clientY
+    const { x, y } = point.matrixTransform(matrix.inverse())
+    const latitude = Math.max(-90, Math.min(90, origin.lat - (y - H / 2) * metersPerPixel / 111320))
+    const longitude = origin.lng + (x - W / 2) * metersPerPixel / (111320 * longitudeScale)
+    onOrigin({ lat: latitude, lng: ((longitude + 180) % 360 + 360) % 360 - 180 })
+  }
   return <div className="map-canvas"><svg viewBox={`0 0 ${W} ${H}`} aria-label="Schematic driver map. Select an origin using the coordinate controls or click the map." onClick={selectOrigin}><defs><pattern id="map-grid" width="95" height="86" patternUnits="userSpaceOnUse" patternTransform="rotate(-18)"><rect width="95" height="86" fill="#eaece3"/><rect x="10" y="10" width="70" height="60" rx="7" fill="#e2e6da"/><path d="M0 0h95v86" fill="none" stroke="#faf9f4" strokeWidth="12"/></pattern></defs><rect width={W} height={H} fill="url(#map-grid)"/><path d="M-50 350C80 270 160 430 320 320S530 255 630 380 770 490 980 420" stroke="#f8f6ed" strokeWidth="33" fill="none"/><path d="M-50 350C80 270 160 430 320 320S530 255 630 380 770 490 980 420" stroke="#ddcfac" strokeWidth="20" fill="none"/><path d="M100-50C120 200 330 170 420 390S600 500 680 700" stroke="#f8f6ed" strokeWidth="25" fill="none"/><path d="M100-50C120 200 330 170 420 390S600 500 680 700" stroke="#ddd9c5" strokeWidth="13" fill="none"/><path d="M725-15C650 80 710 180 840 200S1000 230 1000 140V0z" fill="#c4d9d9" stroke="#b6cecf" strokeWidth="2"/><path d="M60 65 130 55 155 115 82 135z M690 440l87-15 40 73-110 24z M330 48l78 23-18 57-70-8z" fill="#cedabf"/><g className="map-labels"><text x="107" y="229">HYDERABAD</text><text x="623" y="100">North district</text><text x="151" y="493">West district</text><text x="639" y="540">South district</text></g><circle cx={W/2} cy={H/2} r={5000 / metersPerPixel} fill="#e9753c" fillOpacity=".035" stroke="#dd8159" strokeWidth="1.7" strokeDasharray="6 6"/><g transform={`translate(${W/2}, ${H/2})`}><circle r="33" fill="#e77540" opacity=".11"/><circle r="21" fill="white" stroke="#e77540" strokeWidth="2"/><path d="M-9-7h18v5H-9z M-7-2v10H7V-2 M-2 8V2h4v6" fill="none" stroke="#d86431" strokeWidth="1.6"/><rect x="-44" y="33" width="88" height="26" rx="6" fill="white"/><text textAnchor="middle" y="50" fill="#87624b" fontSize="12">Your origin</text></g>{drivers.map((d, i) => { const [x,y] = toPoint(d.location.coordinates); return <g key={d.driver_id || d._id} transform={`translate(${x}, ${y})`} className="map-marker" tabIndex={0} role="button" aria-label={`Select driver ${d.driver_id}, ${d.distance_meters ?? d.dist?.calculated} metres away`} onClick={(e) => { e.stopPropagation(); setSelected(d.driver_id) }} onKeyDown={(e) => { if (['Enter',' '].includes(e.key)) { e.preventDefault(); setSelected(d.driver_id) } }}><circle r={selected === d.driver_id ? 23 : 18} fill={selected === d.driver_id ? '#df703b' : '#4d7663'} stroke="white" strokeWidth="3"/><text textAnchor="middle" y="5" fill="white" fontSize="14" fontWeight="700">{i + 1}</text></g> })}</svg><div className="map-badge"><span className="live-dot"/> Active drivers <span>· 5 km radius</span></div><div className="map-zoom"><button aria-label="Zoom in" disabled={zoom >= 1.8} onClick={() => setZoom((z) => Math.min(1.8,z + .2))}><Icon name="plus" size={18}/></button><button aria-label="Zoom out" disabled={zoom <= .6} onClick={() => setZoom((z) => Math.max(.6,z - .2))}>−</button><button aria-label="Reset zoom" onClick={() => setZoom(1)}><Icon name="target" size={17}/></button></div><div className="map-legend"><span><i/> Driver</span><span><i className="origin"/> Origin</span><span className="schematic-label">Schematic basemap</span></div><div className="map-scale"><span style={{ width: `${1000 / metersPerPixel / W * 100}vw`, maxWidth: 90, minWidth: 30 }}/><b>1 km</b></div></div>
 }
 export default function Drivers({ restaurants, restaurantsResource, restaurantId, setRestaurantId, revision }) {

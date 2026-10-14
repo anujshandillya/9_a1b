@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { initials, money, number } from '../lib/format'
 
 const paths = {
@@ -69,8 +70,7 @@ export function Modal({ title, onClose, children }) {
     document.addEventListener('keydown', keydown)
     return () => { document.body.style.overflow = oldOverflow; document.removeEventListener('keydown', keydown); previous?.focus() }
   }, [onClose])
-  return <div className="modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}><div className="modal" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1} ref={dialog}><div className="modal-heading"><h2>{title}</h2><button className="icon-button" aria-label="Close details" onClick={onClose}><Icon name="close"/></button></div>{children}</div></div>
+  return createPortal(<div className="modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}><div className="modal" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1} ref={dialog}><div className="modal-heading"><h2>{title}</h2><button className="icon-button" aria-label="Close details" onClick={onClose}><Icon name="close"/></button></div>{children}</div></div>, document.body)
 }
 export function Notice({ children, type = 'info' }) { return <div className={`notice ${type}`} role={type === 'error' ? 'alert' : 'status'}><Icon name={type === 'success' ? 'check' : 'info'} size={18}/><div>{children}</div></div> }
-export function RestaurantSelect({ restaurants, value, onChange, id = 'restaurant-select' }) { return <select id={id} value={value} onChange={(e) => onChange(e.target.value)} disabled={!restaurants.length}>{restaurants.length ? restaurants.map((r) => <option key={r.id} value={r.id}>{r.name}</option>) : <option>Restaurants unavailable</option>}</select> }
 export function BalanceCard({ user }) { return <div className="balance-card"><div><Icon name="wallet"/><span>Available wallet balance</span></div><strong>{money(user?.wallet_balance)}</strong><span>{user?.name || 'Select a customer'}</span><div className="balance-decoration"><span/><span/><span/></div></div> }
