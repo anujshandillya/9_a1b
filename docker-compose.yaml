@@ -108,6 +108,24 @@ services:
       retries: 10
       start_period: 10s
 
+  # Keeps the Workflow 3 map alive: inserts fresh DriverPings every few seconds
+  # (seeded pings expire after 2 h). Reuses the API image, which has pymongo.
+  live-pings:
+    build: ./api
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      MONGO_URI: mongodb://mongo:27017/
+      MONGO_DB: bitestream
+      LIVE_PINGS_INTERVAL: ${LIVE_PINGS_INTERVAL:-5}
+      LIVE_PINGS_DRIVERS: ${LIVE_PINGS_DRIVERS:-150}
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./data_generation:/data_generation:ro
+    command: python /data_generation/live_pings.py
+    restart: unless-stopped   # after editing live_pings.py: docker compose restart live-pings
+
 volumes:
   postgres-data:
   mongo-data:
