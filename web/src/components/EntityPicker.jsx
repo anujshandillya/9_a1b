@@ -9,9 +9,9 @@ function PickerDialog({ entity, onChange, onClose }) {
   const resource = useResource(`/${entity}?${query({ q, page, limit: 8 })}`)
   const rows = itemsOf(resource.data)
   return <Modal title={entity === 'users' ? 'Choose a customer' : 'Choose a restaurant'} onClose={onClose}>
-    <label className="search-input picker-search"><Icon name="search"/><input autoFocus aria-label={`Search ${entity} by name`} placeholder="Search by name…" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1) }}/></label>
+    <label className="search-input picker-search"><input autoFocus aria-label={`Search ${entity} by name`} placeholder="Search by name…" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1) }}/></label>
     <ResourceState resource={resource} empty={resource.data && !rows.length} emptyTitle="No matches found"/>
-    <div className="picker-results">{rows.map((row) => <button key={row.id} onClick={() => { onChange(row.id); onClose() }}><span><b>{row.name}</b><small>{row.id}</small></span><Icon name="arrow" size={16}/></button>)}</div>
+    <div className="picker-results">{rows.map((row) => <button key={row.id} onClick={() => { onChange(row.id); onClose() }}><span><b>{row.name}</b><small>{row.id}</small></span></button>)}</div>
     {resource.data && !resource.error && <Pagination page={page} total={resource.data.total} onChange={setPage}/>}
   </Modal>
 }

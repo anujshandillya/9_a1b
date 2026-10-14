@@ -16,7 +16,7 @@ export default function WalletTopUp({ actorId, update }) {
       setResult(data); update('Wallet topped up. A credit entry was recorded.')
     } catch (error) { setError(error.message) } finally { setBusy(false) }
   }
-  return <Panel title="Top up this wallet" description="Add demo funds and record a wallet credit.">
+  return <Panel title="Top up this wallet" description="Add funds to the selected customer’s wallet.">
     <form className="topup-form" onSubmit={submit}>
       <label className="form-field"><span>Top-up amount (INR)</span><input aria-label="Top-up amount" type="number" min="0.01" max="99999999.99" step="0.01" required value={amount} onChange={(event) => setAmount(event.target.value)}/></label>
       <button className="button secondary" disabled={busy || !validAmount(amount)}>{busy ? 'Adding funds…' : 'Add funds'}</button>

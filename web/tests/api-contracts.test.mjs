@@ -1,11 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { apiError, normalizeResponse, validAmount } from '../src/lib/contracts.js'
-import { DEMO_MODE, request } from '../src/lib/api.js'
-import { createDemoState, demoRequest, FIXTURES } from '../src/lib/demo.js'
+import { request } from '../src/lib/api.js'
 
-test('live API is the default; moving average consumes series and date from api/main.py', () => {
-  assert.equal(DEMO_MODE, false)
+test('moving average consumes the API series and date fields', () => {
   const result = normalizeResponse('/analytics/moving-average?restaurant_id=r', {
     restaurant_id: 'r', series: [{ date: '2026-10-14', daily_revenue: '123.40', moving_avg_7_day: '17.63' }],
   })
@@ -43,16 +41,6 @@ test('flat driver coordinates and distance_m become map coordinates and metres',
   assert.equal(result.items[0].distance_meters, 314)
 })
 
-test('demo contracts remain compatible with the normalized UI', () => {
-  const state = createDemoState()
-  for (const path of ['/analytics/moving-average', '/drivers/nearby?lat=17.3616&lng=78.4747', `/restaurants/${FIXTURES.restaurant}/reviews/analytics`]) {
-    const raw = demoRequest(state, path)
-    const result = normalizeResponse(path, raw)
-    if (path.includes('reviews')) assert.equal(result.overall_average_rating[0].total_reviews, 550)
-    else assert.ok(result.items.length > 0)
-  }
-})
-
 test('named API errors stay actionable without confusing other P0001 rules with insufficient funds', () => {
   assert.match(apiError({ error_code: 'ACTIVE_ORDER_EXISTS', sqlstate: '23505' }).message, /Browse/)
   assert.match(apiError({ error_code: 'INSUFFICIENT_BALANCE' }).message, /top up/)
@@ -63,18 +51,6 @@ test('named API errors stay actionable without confusing other P0001 rules with 
 test('checkout accepts valid cents without floating point multiplication errors', () => {
   for (const amount of ['0.01', '0.29', '19.99', '420.00', '99999999.99']) assert.equal(validAmount(amount), true, amount)
   for (const amount of ['', '0', '-1', '1.001', 'NaN', 'Infinity', '100000000', '1e3']) assert.equal(validAmount(amount), false, amount)
-})
-
-test('top-up creates one credit and funds the chosen wallet; invalid requests change nothing', () => {
-  const state = createDemoState(), count = state.audit.length
-  const result = demoRequest(state, `/users/${FIXTURES.low}/topup`, 'POST', { amount: 500 })
-  assert.equal(result.user.wallet_balance, 545)
-  assert.equal(result.audit_entry.action_type, 'CREDIT')
-  assert.equal(result.audit_entry.balance_after, 545)
-  assert.equal(state.audit.length, count + 1)
-  const before = JSON.stringify(state)
-  assert.throws(() => demoRequest(state, `/users/${FIXTURES.low}/topup`, 'POST', { amount: -1 }))
-  assert.equal(JSON.stringify(state), before)
 })
 
 test('request sends the expected method/body, adapts actual API data and propagates errors', async (t) => {
@@ -89,4 +65,45 @@ test('request sends the expected method/body, adapts actual API data and propaga
   assert.equal(calls[1].url, '/api/checkout')
   assert.equal(calls[1].options.method, 'POST')
   assert.equal(JSON.parse(calls[1].options.body).amount, 19.99)
+})
+
+
+test('wallet top-up posts to the selected API customer and returns the server credit', async (t) => {
+  const controller = new AbortController()
+  const credit = { user: { id: 'customer-id', wallet_balance: '545.00' }, audit_entry: { id: 'credit-id', action_type: 'CREDIT', amount_changed: '500.00', balance_after: '545.00' } }
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(url, '/api/users/customer-id/topup')
+    assert.equal(options.method, 'POST')
+    assert.equal(options.signal, controller.signal)
+    assert.equal(options.headers['Content-Type'], 'application/json')
+    assert.deepEqual(JSON.parse(options.body), { amount: 500 })
+    return new Response(JSON.stringify(credit))
+  })
+  assert.deepEqual(await request('/users/customer-id/topup', { method: 'POST', body: { amount: 500 }, signal: controller.signal }), credit)
+})
+
+test('API connection failure is surfaced without sample data', async (t) => {
+  const failure = new TypeError('Connection refused')
+  t.mock.method(globalThis, 'fetch', async () => { throw failure })
+  await assert.rejects(request('/restaurants'), (error) => {
+    assert.match(error.message, /Unable to reach the BiteStream API/)
+    assert.equal(error.cause, failure)
+    return true
+  })
+})
+
+test('unreadable API responses are rejected', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response('<html>Unavailable</html>', { status: 502 }))
+  await assert.rejects(request('/orders'), /unreadable response/)
+})
+
+test('cancelling a request preserves AbortError', async (t) => {
+  const cancellation = new DOMException('Aborted', 'AbortError')
+  t.mock.method(globalThis, 'fetch', async () => { throw cancellation })
+  await assert.rejects(request('/users'), (error) => error === cancellation)
+})
+
+test('an empty API list stays empty', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ items: [], total: 0 })))
+  assert.deepEqual(await request('/restaurants'), { items: [], total: 0 })
 })
