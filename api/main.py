@@ -114,9 +114,9 @@ def _restaurant_or_404(restaurant_id: UUID):
 
 def _find_menu(restaurant: dict, mongo_key: Optional[str]):
     keys = _mongo_keys(restaurant["id"], mongo_key)
-    doc = db.mongo.menus.find_one({"restaurant_id": {"$in": keys}})
+    doc = db.mongo["Menus"].find_one({"restaurant_id": {"$in": keys}})
     if doc is None:  # fallback: match by name
-        doc = db.mongo.menus.find_one({"restaurant_name": restaurant["name"]})
+        doc = db.mongo["Menus"].find_one({"restaurant_name": restaurant["name"]})
     if doc is not None:
         doc["_id"] = str(doc["_id"])
     return doc
@@ -515,7 +515,7 @@ def drivers_nearby(
             "lat": {"$arrayElemAt": ["$location.coordinates", 1]},
         }},
     ]
-    items = list(db.mongo.driverPings.aggregate(pipeline, allowDiskUse=True))
+    items = list(db.mongo["DriverPings"].aggregate(pipeline, allowDiskUse=True))
     return {
         "origin": {"lng": lng, "lat": lat},
         "radius_m": radius,
@@ -548,7 +548,7 @@ def review_analytics(restaurant_id: UUID, mongo_key: Optional[str] = None):
             ],
         }},
     ]
-    res = next(db.mongo.reviews.aggregate(pipeline), {})
+    res = next(db.mongo["Reviews"].aggregate(pipeline), {})
     counts = {int(d["_id"]): d["count"] for d in res.get("rating_distribution", [])}
     overall = (res.get("overall_average_rating") or [{}])[0]
     return {
