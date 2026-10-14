@@ -32,35 +32,54 @@ end on top.
 └── web/                 # front end (Anuj)
 ```
 
-## Setup: database (no Docker needed)
+## Setup (Docker, recommended)
 
-Docker is optional per the A1B spec. Everything runs natively.
+`docker compose watch` runs PostgreSQL 18, MongoDB 7, the API (FastAPI, port 8000), the web app
+(Vite, port 5173) and a live driver-ping generator. On a fresh volume, Postgres runs `sql/` and Mongo
+runs `mongo/01_collections_and_indexes.js` automatically. **Seeding is a separate step** (below).
 
-**Prerequisites:** PostgreSQL 14+ with `psql` (tested on 18.6), MongoDB 7+ with `mongosh` (tested
-on 8.0.34), Python 3.10+.
+**Prerequisites:** Docker Desktop (running), Python 3.10+ for the seeders. Ports 5432, 27017, 8000
+and 5173 must be free (stop a local Postgres / MongoDB if you have one, e.g. `brew services stop postgresql@18`).
 
 ```bash
-# 1. Configuration
-cp .env.example .env            # edit PGUSER / PGPASSWORD to match your local Postgres
+# 1. Configuration (compose and the seeders both read .env)
+cp .env.example .env                       # keep PGUSER=postgres / PGPASSWORD=postgres
 
-# 2. Python environment for the seeders
+# 2. Images (the compose file never pulls them itself)
+docker pull postgres:18-alpine && docker pull mongo:7.0.40-jammy
+
+# 3. Start everything (keep this terminal open)
+docker compose watch                        # first run builds the api / web images
+
+# 4. Seed, in a second terminal (about 15 s). Postgres FIRST: the Mongo seeders read Postgres ids.
 python3 -m venv data_generation/.venv
 data_generation/.venv/bin/pip install -r data_generation/requirements.txt
-
-# 3. Schemas
-createdb bitestream
-for f in sql/0[1-5]*.sql; do psql -v ON_ERROR_STOP=1 -d bitestream -f "$f"; done
-mongosh mongo/01_collections_and_indexes.js      # drops + recreates the Mongo collections
-
-# 4. Seed (about 15 s). Postgres FIRST: the Mongo seeders read Postgres ids.
 cd data_generation
 .venv/bin/python postgres_seeder.py --clear
-.venv/bin/python mongo_seeder.py                # DriverPings expire after 2 h; re-run before demos
+.venv/bin/python mongo_seeder.py
 .venv/bin/python reviews_seeder.py
 .venv/bin/python menus_seeder.py
 cd ..
+```
 
-# 5. Run the workflows / evidence
+Open **http://localhost:5173** (web) · **http://localhost:8000/docs** (API docs) ·
+**http://localhost:8000/api/health** (health check).
+
+- **Database already initialised from older `sql/` files?** Init scripts only run on an empty volume.
+  Either reset (`docker compose down -v`, then steps 3–4), or apply the changed file in place:
+  `docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/05_materialized_views.sql'`.
+- **Live driver pings:** the `live-pings` service inserts 150 drivers' positions every 5 s, so the map
+  always has fresh, moving drivers (`LIVE_PINGS_INTERVAL` / `LIVE_PINGS_DRIVERS` in `.env` to tune;
+  `docker compose logs -f live-pings` to watch). Without Docker: `cd data_generation && .venv/bin/python live_pings.py`.
+
+**Without Docker:** install PostgreSQL 14+ and MongoDB 7+ locally, set `.env` to your local user, then
+`createdb bitestream`, `for f in sql/0[1-5]*.sql; do psql -v ON_ERROR_STOP=1 -d bitestream -f "$f"; done`,
+`mongosh mongo/01_collections_and_indexes.js`, and run the four seeders as above. Run the API from `api/`
+(`uvicorn main:app --port 8000`) and the web app from `web/` (`yarn dev`).
+
+**Run the workflows / evidence directly** (with the local tools, or via `docker compose exec`):
+
+```bash
 psql -d bitestream -f sql/06_window_analytics.sql   # WF2
 mongosh mongo/02_workflow3_geonear.js               # WF3
 mongosh mongo/03_workflow4_facet.js                 # WF4
@@ -69,7 +88,7 @@ bash performance/generate_reports.sh                # EXPLAIN / executionStats f
 
 **Expected data (default flags):** 5,000 users · 200 restaurants · 100,300 orders (100,000
 DELIVERED + ~188 PREPARING + ~112 DELIVERING) · 129,966 wallet audit rows · 200 menus · 110,000
-reviews · 510,000 driver pings.
+reviews · 510,000 seeded driver pings (plus the live ones).
 
 **Demo fixtures (fixed IDs on every machine):**
 
@@ -81,7 +100,7 @@ reviews · 510,000 driver pings.
 | Demo User (Active Order) | `00000000-0000-4000-8000-000000000003` | has a PREPARING order, so checkout fails: active order |
 
 **Workflow 1 (checkout)** must be called in **autocommit mode** (not inside `BEGIN … COMMIT`),
-because the procedure manages its own REPEATABLE READ transaction:
+because the procedure manages its own REPEATABLE READ transaction (the API does this):
 
 ```sql
 CALL sp_execute_checkout('<user_uuid>', '<restaurant_uuid>', 250.00);   -- returns p_order_id
@@ -90,9 +109,21 @@ CALL sp_execute_checkout('<user_uuid>', '<restaurant_uuid>', 250.00);   -- retur
 Errors: `P0001` insufficient balance · `23505` user already has an active order · `22023` amount ≤ 0 ·
 `23503` unknown user/restaurant · `40001` concurrent checkout (retry).
 
-## Setup: API and web
+## Tests
 
-_TODO: Vedant (API) and Anuj (web): install / run steps, env vars, ports._
+```bash
+# API (needs the stack running and the database seeded; uses throw-away test users)
+docker compose exec backend sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q"
+
+# Web (pure contract / validation tests)
+cd web && node --test tests/*.test.mjs
+```
+
+| Suite | Covers |
+|---|---|
+| `api/tests/test_checkout.py` | Checkout success (balance before/after, DEBIT audit row), insufficient balance (rolled back, no order, no audit row), second active order blocked until the first is delivered, invalid / too-large amounts, unknown user / restaurant, top-up CREDIT and balance-overflow rejection |
+| `api/tests/test_analytics_audit_map.py` | Refresh updates both materialized views and logs them; "last refreshed" comes from the log; audit date filter time zone (browser zone or IST fallback); nearby drivers are distinct, active, ≤ 5 km and sorted |
+| `web/tests/api-contracts.test.mjs` | API response adapters, error messages, amount validation in the browser (incl. top-up balance limit), browser time zone |
 
 ## Database: performance proof (EXPLAIN)
 
@@ -134,6 +165,9 @@ and [`docs/database_guide.md` §8](docs/database_guide.md#8-what-we-inherited-wh
 | `mongo/02_workflow3_geonear.js` | Origin = the restaurant's location. Results grouped per driver. |
 | `mongo/03_workflow4_facet.js` | Collection name + a valid restaurant id |
 | `docs/`, `performance/` | ERD, Mongo schema map, EXPLAIN files, handover note, database guide |
+| `sql/05_materialized_views.sql` (again) | `mv_refresh_log` table (created, kept, or replaced after a schema check), refresh functions log every refresh, `fn_refresh_all_revenue_views()` refreshes both views |
+| `data_generation/live_pings.py` | New: live driver pings (runs as the `live-pings` compose service) |
+| `data_generation/postgres_seeder.py` (again) | Final view refresh goes through `fn_refresh_all_revenue_views()` so it is logged |
 
 ## Assumptions (database)
 
@@ -143,7 +177,10 @@ and [`docs/database_guide.md` §8](docs/database_guide.md#8-what-we-inherited-wh
 - A user's opening balance is recorded as a CREDIT audit row by the seeder (the spec's trigger only fires on UPDATE).
 - Historical orders are bulk-loaded with backdated timestamps. Live orders go through the stored procedure.
 - "Completed" order = status `DELIVERED`. "Active" = `PREPARING` or `DELIVERING`.
-- Seeded driver pings are meant to be short-lived (2 h TTL), so re-seed them before a demo.
+- Seeded driver pings are short-lived (2 h TTL). The `live-pings` service keeps fresh ones coming.
+- Revenue analytics count `DELIVERED` orders only. The chart and ranking are live; the summary numbers come from the materialized views and change when Refresh is pressed.
+- The audit date filter uses whole days in the viewer's browser time zone (IST if unknown). Times on screen are shown in IST.
+- Amounts are limited to ₹9,99,99,999.99 (`DECIMAL(10,2)`), checked in the browser, the API and the database.
 
 ## Tech choices
 
