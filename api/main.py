@@ -1,3 +1,4 @@
+
 """BiteStream API - thin layer over the PostgreSQL + MongoDB objects from Assignment 1.
 
 Rule: the database does the real work (stored procedure, trigger, materialized view,
@@ -76,7 +77,11 @@ async def pg_error_handler(_: Request, exc: psycopg.Error):
 async def validation_handler(_: Request, exc: RequestValidationError):
     first = exc.errors()[0] if exc.errors() else {}
     where = ".".join(str(p) for p in first.get("loc", []) if p != "body")
-    return _err(400, "VALIDATION_ERROR", f"Invalid input for '{where}': {first.get('msg', 'bad value')}")
+    return _err(
+        400,
+        "VALIDATION_ERROR",
+        f"Invalid input for '{where}': {first.get('msg', 'bad value')}",
+    )
 
 
 @app.exception_handler(Exception)
@@ -106,7 +111,10 @@ def _mongo_keys(pg_id: UUID, override: Optional[str]):
 
 
 def _restaurant_or_404(restaurant_id: UUID):
-    r = db.one("SELECT id, name, latitude, longitude FROM restaurants WHERE id = %s", [restaurant_id])
+    r = db.one(
+        "SELECT id, name, latitude, longitude FROM restaurants WHERE id = %s",
+        [restaurant_id],
+    )
     if r is None:
         raise ApiError(404, "RESTAURANT_NOT_FOUND", "Restaurant not found.")
     return r
@@ -115,7 +123,7 @@ def _restaurant_or_404(restaurant_id: UUID):
 def _find_menu(restaurant: dict, mongo_key: Optional[str]):
     keys = _mongo_keys(restaurant["id"], mongo_key)
     doc = db.mongo["Menus"].find_one({"restaurant_id": {"$in": keys}})
-    if doc is None:  # fallback: match by name
+    if doc is None:
         doc = db.mongo["Menus"].find_one({"restaurant_name": restaurant["name"]})
     if doc is not None:
         doc["_id"] = str(doc["_id"])
@@ -123,7 +131,7 @@ def _find_menu(restaurant: dict, mongo_key: Optional[str]):
 
 
 def _last_refreshed():
-    try:  # table planned by Aditya (AI.md 5.3); column name: refreshed_at
+    try:
         row = db.one("SELECT MAX(refreshed_at) AS t FROM mv_refresh_log")
         if row and row["t"]:
             return row["t"]
@@ -133,12 +141,12 @@ def _last_refreshed():
 
 
 def _window_sql() -> str:
-    """Load Workflow 2 query from sql/06_window_analytics.sql so the DB file stays the source of truth."""
+    """Load Workflow 2 query from sql/06_window_analytics.sql."""
     path = SQL_DIR / "06_window_analytics.sql"
     if not path.exists():
         raise ApiError(500, "SQL_FILE_MISSING", f"Cannot find {path}. Set SQL_DIR.")
     text = path.read_text(encoding="utf-8").strip().rstrip(";").strip()
-    return text.replace("%", "%%")  # psycopg treats % as a placeholder
+    return text.replace("%", "%%")
 
 
 # --------------------------------------------------------------------------- health
@@ -154,18 +162,27 @@ def health():
         mongo_ok = True
     except Exception:
         pass
-    return {"status": "ok" if pg and mongo_ok else "degraded", "postgres": pg, "mongo": mongo_ok}
+    return {
+        "status": "ok" if pg and mongo_ok else "degraded",
+        "postgres": pg,
+        "mongo": mongo_ok,
+    }
 
 
 # --------------------------------------------------------------------------- browse
 @app.get("/api/users")
-def list_users(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), q: Optional[str] = None):
+def list_users(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    q: Optional[str] = None,
+):
     where, params = "", []
     if q:
         where, params = "WHERE name ILIKE %s", [_like(q)]
     total = db.one(f"SELECT COUNT(*) AS n FROM users {where}", params)["n"]
     items = db.all(
-        f"SELECT id, name, wallet_balance FROM users {where} ORDER BY name, id LIMIT %s OFFSET %s",
+        f"""SELECT id, name, wallet_balance FROM users {where}
+            ORDER BY name, id LIMIT %s OFFSET %s""",
         params + [limit, (page - 1) * limit],
     )
     return _paged(items, total, page, limit)
@@ -173,11 +190,15 @@ def list_users(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100),
 
 @app.get("/api/users/{user_id}")
 def get_user(user_id: UUID):
-    user = db.one("SELECT id, name, wallet_balance FROM users WHERE id = %s", [user_id])
+    user = db.one(
+        "SELECT id, name, wallet_balance FROM users WHERE id = %s",
+        [user_id],
+    )
     if user is None:
         raise ApiError(404, "USER_NOT_FOUND", "User not found.")
     user["recent_orders"] = db.all(
-        """SELECT o.id, o.restaurant_id, r.name AS restaurant_name, o.total_amount, o.status, o.created_at
+        """SELECT o.id, o.restaurant_id, r.name AS restaurant_name,
+                  o.total_amount, o.status, o.created_at
            FROM orders o JOIN restaurants r ON r.id = o.restaurant_id
            WHERE o.user_id = %s ORDER BY o.created_at DESC LIMIT 10""",
         [user_id],
@@ -191,33 +212,42 @@ class TopUp(BaseModel):
 
 @app.post("/api/users/{user_id}/topup")
 def topup(user_id: UUID, body: TopUp):
-    """Demo helper: add money so a user can recover from 'insufficient balance'.
-    The UPDATE fires the audit trigger, which writes a CREDIT row."""
+    """Add money to a user's wallet. The UPDATE fires the audit trigger."""
     amount = body.amount.quantize(Decimal("0.01"), ROUND_HALF_UP)
     if amount <= 0:
         raise ApiError(400, "INVALID_AMOUNT", "Top-up amount must be greater than zero.")
     with db.pool.connection() as conn:
         row = conn.execute(
-            "UPDATE users SET wallet_balance = wallet_balance + %s WHERE id = %s RETURNING id, name, wallet_balance",
+            """UPDATE users
+               SET wallet_balance = wallet_balance + %s
+               WHERE id = %s
+               RETURNING id, name, wallet_balance""",
             [amount, user_id],
         ).fetchone()
         if row is None:
             raise ApiError(404, "USER_NOT_FOUND", "User not found.")
         audit = conn.execute(
-            'SELECT * FROM wallet_audit_logs WHERE user_id = %s ORDER BY "timestamp" DESC, id DESC LIMIT 1',
+            """SELECT * FROM wallet_audit_logs
+               WHERE user_id = %s
+               ORDER BY "timestamp" DESC, id DESC LIMIT 1""",
             [user_id],
         ).fetchone()
     return {"user": row, "audit_entry": audit}
 
 
 @app.get("/api/restaurants")
-def list_restaurants(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), q: Optional[str] = None):
+def list_restaurants(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    q: Optional[str] = None,
+):
     where, params = "", []
     if q:
         where, params = "WHERE name ILIKE %s", [_like(q)]
     total = db.one(f"SELECT COUNT(*) AS n FROM restaurants {where}", params)["n"]
     items = db.all(
-        f"SELECT id, name, latitude, longitude FROM restaurants {where} ORDER BY name, id LIMIT %s OFFSET %s",
+        f"""SELECT id, name, latitude, longitude FROM restaurants {where}
+            ORDER BY name, id LIMIT %s OFFSET %s""",
         params + [limit, (page - 1) * limit],
     )
     return _paged(items, total, page, limit)
@@ -263,7 +293,8 @@ def list_orders(
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     total = db.one(f"SELECT COUNT(*) AS n FROM orders o {where}", params)["n"]
     items = db.all(
-        f"""SELECT o.id, o.user_id, u.name AS user_name, o.restaurant_id, r.name AS restaurant_name,
+        f"""SELECT o.id, o.user_id, u.name AS user_name,
+                   o.restaurant_id, r.name AS restaurant_name,
                    o.total_amount, o.status, o.created_at
             FROM orders o
             JOIN users u ON u.id = o.user_id
@@ -275,10 +306,12 @@ def list_orders(
     return _paged(items, total, page, limit)
 
 
-_ORDER_DETAIL = """SELECT o.id, o.user_id, u.name AS user_name, o.restaurant_id, r.name AS restaurant_name,
+_ORDER_DETAIL = """SELECT o.id, o.user_id, u.name AS user_name,
+                          o.restaurant_id, r.name AS restaurant_name,
                           o.total_amount, o.status, o.created_at
                    FROM orders o JOIN users u ON u.id = o.user_id
-                   JOIN restaurants r ON r.id = o.restaurant_id WHERE o.id = %s"""
+                   JOIN restaurants r ON r.id = o.restaurant_id
+                   WHERE o.id = %s"""
 
 
 @app.get("/api/orders/{order_id}")
@@ -291,9 +324,12 @@ def get_order(order_id: UUID):
 
 @app.post("/api/orders/{order_id}/advance")
 def advance_order(order_id: UUID):
-    """PREPARING -> DELIVERING -> DELIVERED. Lets the demo free a user's active-order slot."""
+    """PREPARING -> DELIVERING -> DELIVERED."""
     with db.pool.connection() as conn:
-        row = conn.execute("SELECT status FROM orders WHERE id = %s FOR UPDATE", [order_id]).fetchone()
+        row = conn.execute(
+            "SELECT status FROM orders WHERE id = %s FOR UPDATE",
+            [order_id],
+        ).fetchone()
         if row is None:
             raise ApiError(404, "ORDER_NOT_FOUND", "Order not found.")
         nxt = NEXT_STATUS.get(row["status"])
@@ -314,22 +350,43 @@ _RETRY_STATES = ("40001", "40P01")
 
 
 def _checkout_once(conn, user_id, restaurant_id, amount):
-    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
-    before = conn.execute("SELECT wallet_balance FROM users WHERE id = %s", [user_id]).fetchone()
-    if before is None:
-        raise ApiError(404, "USER_NOT_FOUND", "User not found.")
-    conn.execute("CALL sp_execute_checkout(%s, %s, %s)", [user_id, restaurant_id, amount])
-    order = conn.execute(
-        """SELECT id, user_id, restaurant_id, total_amount, status, created_at FROM orders
-           WHERE user_id = %s AND restaurant_id = %s ORDER BY created_at DESC, id LIMIT 1""",
-        [user_id, restaurant_id],
-    ).fetchone()
-    audit = conn.execute(
-        'SELECT * FROM wallet_audit_logs WHERE user_id = %s ORDER BY "timestamp" DESC, id DESC LIMIT 1',
+    # The stored procedure manages its own transaction. CALL must run in
+    # autocommit mode and must not be wrapped in BEGIN/COMMIT here.
+    before = conn.execute(
+        "SELECT wallet_balance FROM users WHERE id = %s",
         [user_id],
     ).fetchone()
-    after = conn.execute("SELECT wallet_balance FROM users WHERE id = %s", [user_id]).fetchone()
-    conn.execute("COMMIT")
+    if before is None:
+        raise ApiError(404, "USER_NOT_FOUND", "User not found.")
+
+    # p_order_id is INOUT; PostgreSQL returns its value as a row.
+    result = conn.execute(
+        "CALL sp_execute_checkout(%s, %s, %s, %s)",
+        [user_id, restaurant_id, amount, None],
+    ).fetchone()
+    if result is None or result["p_order_id"] is None:
+        raise ApiError(
+            500,
+            "CHECKOUT_RESULT_MISSING",
+            "Checkout completed without returning an order ID.",
+        )
+
+    order = conn.execute(
+        """SELECT id, user_id, restaurant_id, total_amount, status, created_at
+           FROM orders WHERE id = %s""",
+        [result["p_order_id"]],
+    ).fetchone()
+    audit = conn.execute(
+        """SELECT * FROM wallet_audit_logs
+           WHERE user_id = %s
+           ORDER BY "timestamp" DESC, id DESC LIMIT 1""",
+        [user_id],
+    ).fetchone()
+    after = conn.execute(
+        "SELECT wallet_balance FROM users WHERE id = %s",
+        [user_id],
+    ).fetchone()
+
     return {
         "order": order,
         "balance_before": before["wallet_balance"],
@@ -340,22 +397,17 @@ def _checkout_once(conn, user_id, restaurant_id, amount):
 
 @app.post("/api/checkout")
 def checkout(body: CheckoutRequest):
-    """BEGIN REPEATABLE READ -> CALL sp_execute_checkout -> read results -> COMMIT.
-    Any error => ROLLBACK, and the SQLSTATE is mapped to a friendly message (errors.py)."""
+    """Call the transaction-managing stored procedure in autocommit mode."""
     amount = body.amount.quantize(Decimal("0.01"), ROUND_HALF_UP)
     for attempt in range(3):
         with db.pool.connection() as conn:
-            conn.autocommit = True  # we control BEGIN/COMMIT/ROLLBACK ourselves
+            conn.autocommit = True
             try:
                 return _checkout_once(conn, body.user_id, body.restaurant_id, amount)
             except Exception as exc:
-                try:
-                    conn.execute("ROLLBACK")
-                except psycopg.Error:
-                    pass
                 retry = isinstance(exc, psycopg.Error) and exc.sqlstate in _RETRY_STATES
                 if retry and attempt < 2:
-                    continue  # concurrent update: try again with a fresh snapshot
+                    continue
                 raise
             finally:
                 try:
@@ -373,25 +425,29 @@ def audit_trail(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
 ):
-    user = db.one("SELECT id, name, wallet_balance FROM users WHERE id = %s", [user_id])
+    user = db.one(
+        "SELECT id, name, wallet_balance FROM users WHERE id = %s",
+        [user_id],
+    )
     if user is None:
         raise ApiError(404, "USER_NOT_FOUND", "User not found.")
+
     clauses, params = ["user_id = %s"], [user_id]
     if date_from:
         clauses.append('"timestamp" >= %s')
         params.append(datetime.combine(date_from, datetime.min.time(), tzinfo=timezone.utc))
-    if date_to:  # inclusive end date
+    if date_to:
         clauses.append('"timestamp" < %s')
         params.append(datetime.combine(date_to + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc))
+
     where = " AND ".join(clauses)
     totals = db.one(
         f"""SELECT COUNT(*) AS n,
-                   COALESCE(SUM(amount_changed) FILTER (WHERE action_type = 'DEBIT'), 0)  AS total_debits,
+                   COALESCE(SUM(amount_changed) FILTER (WHERE action_type = 'DEBIT'), 0) AS total_debits,
                    COALESCE(SUM(amount_changed) FILTER (WHERE action_type = 'CREDIT'), 0) AS total_credits
             FROM wallet_audit_logs WHERE {where}""",
         params,
     )
-    # balance_after IS the running balance the DB recorded after each change.
     items = db.all(
         f"""SELECT id, action_type, amount_changed,
                    CASE WHEN action_type = 'DEBIT' THEN -amount_changed ELSE amount_changed END AS signed_amount,
@@ -404,21 +460,30 @@ def audit_trail(
         params + [limit, (page - 1) * limit],
     )
     out = _paged(items, totals["n"], page, limit)
-    out.update(user=user, total_debits=totals["total_debits"], total_credits=totals["total_credits"])
+    out.update(
+        user=user,
+        total_debits=totals["total_debits"],
+        total_credits=totals["total_credits"],
+    )
     return out
 
 
 # ----------------------------------------------- Workflow 2: window analytics + MV
 @app.get("/api/analytics/moving-average")
 def moving_average(restaurant_id: UUID):
-    """7-day moving average series for one restaurant (query from sql/06_window_analytics.sql)."""
+    """7-day moving average series for one restaurant."""
     r = _restaurant_or_404(restaurant_id)
     rows = db.all(
-        f"SELECT * FROM (\n{_window_sql()}\n) w WHERE w.restaurant_id = %s ORDER BY w.revenue_date",
+        f"SELECT * FROM (\n{_window_sql()}\n) w "
+        "WHERE w.restaurant_id = %s ORDER BY w.revenue_date",
         [restaurant_id],
     )
     series = [
-        {"date": x["revenue_date"], "daily_revenue": x["daily_revenue"], "moving_avg_7_day": x["moving_avg_7_day"]}
+        {
+            "date": x["revenue_date"],
+            "daily_revenue": x["daily_revenue"],
+            "moving_avg_7_day": x["moving_avg_7_day"],
+        }
         for x in rows
     ]
     return {
@@ -434,8 +499,10 @@ def moving_average(restaurant_id: UUID):
 def ranking(limit: int = Query(20, ge=1, le=100)):
     """DENSE_RANK() table of restaurants by revenue over the analysed period."""
     items = db.all(
-        f"""SELECT DISTINCT w.restaurant_id, r.name AS restaurant_name, w.period_revenue, w.revenue_rank
-            FROM (\n{_window_sql()}\n) w JOIN restaurants r ON r.id = w.restaurant_id
+        f"""SELECT DISTINCT w.restaurant_id, r.name AS restaurant_name,
+                   w.period_revenue, w.revenue_rank
+            FROM (\n{_window_sql()}\n) w
+            JOIN restaurants r ON r.id = w.restaurant_id
             ORDER BY w.revenue_rank, restaurant_name LIMIT %s""",
         [limit],
     )
@@ -448,29 +515,47 @@ def analytics_summary():
     last = _last_refreshed()
     try:
         totals = db.one(
-            """SELECT COUNT(DISTINCT restaurant_id) AS restaurants, COALESCE(SUM(order_count), 0) AS total_orders,
-                      COALESCE(SUM(daily_revenue), 0) AS total_revenue FROM mv_restaurant_daily_revenue"""
+            """SELECT COUNT(DISTINCT restaurant_id) AS restaurants,
+                      COALESCE(SUM(order_count), 0) AS total_orders,
+                      COALESCE(SUM(daily_revenue), 0) AS total_revenue
+               FROM mv_restaurant_daily_revenue"""
         )
         top = db.all(
-            """SELECT m.restaurant_id, r.name AS restaurant_name, SUM(m.order_count) AS order_count,
+            """SELECT m.restaurant_id, r.name AS restaurant_name,
+                      SUM(m.order_count) AS order_count,
                       SUM(m.daily_revenue) AS revenue
-               FROM mv_restaurant_daily_revenue m JOIN restaurants r ON r.id = m.restaurant_id
-               GROUP BY m.restaurant_id, r.name ORDER BY revenue DESC LIMIT 5"""
+               FROM mv_restaurant_daily_revenue m
+               JOIN restaurants r ON r.id = m.restaurant_id
+               GROUP BY m.restaurant_id, r.name
+               ORDER BY revenue DESC LIMIT 5"""
         )
     except psycopg.errors.ObjectNotInPrerequisiteState:
-        return {"populated": False, "last_refreshed": last, "restaurants": 0, "total_orders": 0,
-                "total_revenue": 0, "top_restaurants": []}
-    return {"populated": True, "last_refreshed": last, "restaurants": totals["restaurants"],
-            "total_orders": totals["total_orders"], "total_revenue": totals["total_revenue"],
-            "top_restaurants": top}
+        return {
+            "populated": False,
+            "last_refreshed": last,
+            "restaurants": 0,
+            "total_orders": 0,
+            "total_revenue": 0,
+            "top_restaurants": [],
+        }
+    return {
+        "populated": True,
+        "last_refreshed": last,
+        "restaurants": totals["restaurants"],
+        "total_orders": totals["total_orders"],
+        "total_revenue": totals["total_revenue"],
+        "top_restaurants": top,
+    }
 
 
 @app.post("/api/analytics/refresh")
 def analytics_refresh():
     try:
         db.run("SELECT fn_refresh_restaurant_daily_revenue()")
-    except (psycopg.errors.FeatureNotSupported, psycopg.errors.ObjectNotInPrerequisiteState):
-        # MV was created WITH NO DATA: CONCURRENTLY needs a first plain refresh.
+    except (
+        psycopg.errors.FeatureNotSupported,
+        psycopg.errors.ObjectNotInPrerequisiteState,
+    ):
         db.run("REFRESH MATERIALIZED VIEW mv_restaurant_daily_revenue")
     _last_refresh_memory["at"] = datetime.now(timezone.utc)
     return {"last_refreshed": _last_refreshed()}
@@ -486,34 +571,41 @@ def drivers_nearby(
     limit: int = Query(20, ge=1, le=100),
     fresh_minutes: int = Query(DRIVER_FRESH_MINUTES, ge=1, le=240),
 ):
-    """$geoNear around a point (or a restaurant). One row per driver (their latest ping),
-    active drivers only, sorted by distance. Poll this endpoint for live updates."""
+    """Find active drivers near a point using MongoDB $geoNear."""
     if restaurant_id is not None:
         r = _restaurant_or_404(restaurant_id)
         lng, lat = r["longitude"], r["latitude"]
     if lng is None or lat is None:
         raise ApiError(400, "VALIDATION_ERROR", "Provide lng & lat, or a restaurant_id.")
+
     since = datetime.now(timezone.utc) - timedelta(minutes=fresh_minutes)
     pipeline = [
-        {"$geoNear": {
-            "near": {"type": "Point", "coordinates": [lng, lat]},
-            "distanceField": "distance_m",
-            "maxDistance": radius,
-            "spherical": True,
-            "query": {"created_at": {"$gte": since}},
-        }},
-        {"$sort": {"created_at": -1}},                                   # newest ping first
-        {"$group": {"_id": "$driver_id", "doc": {"$first": "$$ROOT"}}},  # latest ping per driver
+        {
+            "$geoNear": {
+                "near": {"type": "Point", "coordinates": [lng, lat]},
+                "distanceField": "distance_m",
+                "maxDistance": radius,
+                "spherical": True,
+                "query": {"created_at": {"$gte": since}},
+            }
+        },
+        {"$sort": {"created_at": -1}},
+        {"$group": {"_id": "$driver_id", "doc": {"$first": "$$ROOT"}}},
         {"$replaceRoot": {"newRoot": "$doc"}},
         {"$match": {"active": True}},
         {"$sort": {"distance_m": 1}},
         {"$limit": limit},
-        {"$project": {
-            "_id": 0, "driver_id": 1, "active": 1, "created_at": 1,
-            "distance_m": {"$round": ["$distance_m", 0]},
-            "lng": {"$arrayElemAt": ["$location.coordinates", 0]},
-            "lat": {"$arrayElemAt": ["$location.coordinates", 1]},
-        }},
+        {
+            "$project": {
+                "_id": 0,
+                "driver_id": 1,
+                "active": 1,
+                "created_at": 1,
+                "distance_m": {"$round": ["$distance_m", 0]},
+                "lng": {"$arrayElemAt": ["$location.coordinates", 0]},
+                "lat": {"$arrayElemAt": ["$location.coordinates", 1]},
+            }
+        },
     ]
     items = list(db.mongo["DriverPings"].aggregate(pipeline, allowDiskUse=True))
     return {
@@ -527,26 +619,34 @@ def drivers_nearby(
 # --------------------------------------------------- Workflow 4: review analytics
 @app.get("/api/restaurants/{restaurant_id}/reviews/analytics")
 def review_analytics(restaurant_id: UUID, mongo_key: Optional[str] = None):
-    """$facet: rating distribution, most frequent tags ($unwind), overall average."""
+    """$facet: rating distribution, frequent tags, and average rating."""
     _restaurant_or_404(restaurant_id)
     keys = _mongo_keys(restaurant_id, mongo_key)
     pipeline = [
         {"$match": {"restaurant_id": {"$in": keys}}},
-        {"$facet": {
-            "rating_distribution": [
-                {"$group": {"_id": "$rating", "count": {"$sum": 1}}},
-                {"$sort": {"_id": 1}},
-            ],
-            "most_frequent_tags": [
-                {"$unwind": "$sentiment_tags"},
-                {"$group": {"_id": "$sentiment_tags", "count": {"$sum": 1}}},
-                {"$sort": {"count": -1, "_id": 1}},
-                {"$limit": 10},
-            ],
-            "overall_average_rating": [
-                {"$group": {"_id": None, "average": {"$avg": "$rating"}, "total": {"$sum": 1}}},
-            ],
-        }},
+        {
+            "$facet": {
+                "rating_distribution": [
+                    {"$group": {"_id": "$rating", "count": {"$sum": 1}}},
+                    {"$sort": {"_id": 1}},
+                ],
+                "most_frequent_tags": [
+                    {"$unwind": "$sentiment_tags"},
+                    {"$group": {"_id": "$sentiment_tags", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1, "_id": 1}},
+                    {"$limit": 10},
+                ],
+                "overall_average_rating": [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "average": {"$avg": "$rating"},
+                            "total": {"$sum": 1},
+                        }
+                    }
+                ],
+            }
+        },
     ]
     res = next(db.mongo["Reviews"].aggregate(pipeline), {})
     counts = {int(d["_id"]): d["count"] for d in res.get("rating_distribution", [])}
@@ -554,7 +654,16 @@ def review_analytics(restaurant_id: UUID, mongo_key: Optional[str] = None):
     return {
         "restaurant_id": restaurant_id,
         "total_reviews": overall.get("total", 0),
-        "average_rating": round(overall["average"], 2) if overall.get("average") is not None else None,
-        "rating_distribution": [{"rating": s, "count": counts.get(s, 0)} for s in range(1, 6)],
-        "top_tags": [{"tag": d["_id"], "count": d["count"]} for d in res.get("most_frequent_tags", [])],
+        "average_rating": (
+            round(overall["average"], 2)
+            if overall.get("average") is not None
+            else None
+        ),
+        "rating_distribution": [
+            {"rating": s, "count": counts.get(s, 0)} for s in range(1, 6)
+        ],
+        "top_tags": [
+            {"tag": d["_id"], "count": d["count"]}
+            for d in res.get("most_frequent_tags", [])
+        ],
     }
