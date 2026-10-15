@@ -8,9 +8,13 @@ export function useResource(path, revision = 0, interval = 0) {
   useEffect(() => {
     if (!path) return
     const controller = new AbortController()
+    let loading = false
     async function load() {
+      if (loading || controller.signal.aborted) return
+      loading = true
       try { const data = await request(path, { signal: controller.signal }); if (!controller.signal.aborted) setState({ key, data, error: null }) }
       catch (error) { if (error.name !== 'AbortError' && !controller.signal.aborted) setState({ key, data: null, error }) }
+      finally { loading = false }
     }
     load()
     const timer = interval ? setInterval(load, interval) : null

@@ -19,8 +19,9 @@
 - **Guiding rule from the spec:** *"keep it simple and let the database (stored procedures, triggers,
   views, aggregation pipelines) do the real work."* The API should **call** the DB objects, not
   re-implement their logic in JS/Python.
-- **No Docker.** The A1B spec only *recommends* docker-compose. Everything runs natively; the README
-  has the exact setup steps.
+- **Docker:** the team runs everything with `docker compose watch` (Postgres, Mongo, API, web,
+  live driver pings). Seeding is a separate step from the host. The README has the exact steps
+  (and a no-Docker alternative).
 
 Source documents (in repo root):
 
@@ -39,7 +40,7 @@ Source documents (in repo root):
 |---|---|---|---|
 | **Aditya Chintala** | **Data verification**: verify the inherited DB against the A1 spec, fix it, and **make sure Vedant gets correct data when he seeds his own machine** | `sql/`, `mongo/`, `data_generation/`, `performance/`, `docs/handover_note.md`, `docs/database_guide.md`, `docs/relational_erd.*`, `docs/mongo_schema_map.json` | **DB contract** (§5, frozen), **seeding steps + fixtures** (§5.4) |
 | **Vedant Bhatt** | **Backend / API (middleware)**. Seeds his own local DB with Aditya's seeders. | `api/`, `docs/api_endpoints.md` | API endpoints (§6) that Anuj's frontend uses. API run steps + env vars in the README. |
-| **Anuj Sharma** | **Frontend** | `web/`, `docs/design/` (users, wireframes, style guide) | Screens (§7). Web run steps in the README. |
+| **Anuj Sharma** | **Frontend + `docker-compose.yaml`** | `web/`, `docs/design/` (users, wireframes, style guide), `docker-compose.yaml` | Screens (§7). The compose stack. |
 | **Everyone** | — | `README.md` (fill your own TODO sections/rows), tests in your own folder | — |
 
 > **Team size:** the allocation sheet lists 4 members, but **Sounak Banerjee is not participating**.
@@ -76,20 +77,20 @@ Source documents (in repo root):
 
 ```
 9_a1b/
-├── README.md               # setup (DB part done), EXPLAIN summary, changes, assumptions; API/web/tech TODOs
+├── README.md               # setup (Docker + seeding), tests, EXPLAIN summary, changes, assumptions; tech/team TODOs
 ├── AI.md                   # this file
 ├── .env.example            # PG* + MONGO_URI template (copy to .env, which is git-ignored)
 ├── sql/01..06_*.sql        # PostgreSQL (verified + fixed)
 ├── mongo/01..03_*.js       # MongoDB (verified + fixed)
-├── data_generation/        # postgres_seeder.py, mongo_seeder.py (DriverPings), reviews_seeder.py, menus_seeder.py
+├── data_generation/        # postgres_seeder.py, mongo_seeder.py (DriverPings), reviews_seeder.py, menus_seeder.py, live_pings.py
 ├── performance/            # EXPLAIN / executionStats evidence + generate_reports.sh
 ├── docs/                   # handover_note.md, database_guide.md, relational_erd.png/.svg, mongo_schema_map.json
-├── docker-compose.yaml     # EMPTY. Not used (no Docker); can be deleted
-├── api/                    # Vedant (api/docker-compose.yaml is empty; can be deleted)
-└── web/                    # Anuj (web/docker-compose.yaml is empty; can be deleted)
+├── docker-compose.yaml     # postgres, mongo, backend, frontend, live-pings (Anuj; live-pings added by Aditya)
+├── api/                    # Vedant: FastAPI + api/tests (pytest)
+└── web/                    # Anuj: React/Vite + web/tests (node --test)
 ```
 
-Still to add for submission: `docs/api_endpoints.md`, `docs/design/`, `api/`, `web/`, tests, demo video, README TODOs.
+Still to add for submission: `docs/api_endpoints.md`, `docs/design/`, demo video, README TODOs (tech choices, contributions, commit hash).
 
 ---
 
@@ -116,8 +117,10 @@ Run order: `sql/01` → `02` → `03` → `04` → `05` (all idempotent). `06_wi
 | Advance order status | Plain `UPDATE orders SET status = 'DELIVERING' / 'DELIVERED' WHERE id = …`. Delivering it frees the user to order again. |
 | Wallet top-up (optional) | Plain `UPDATE users SET wallet_balance = wallet_balance + X WHERE id = …`. The trigger logs a CREDIT. |
 | `mv_restaurant_revenue_summary` | **Spec MV:** `(restaurant_id, restaurant_name, completed_order_count, total_revenue, last_completed_order_at)`, one row per restaurant, DELIVERED orders only. |
-| `SELECT fn_refresh_restaurant_revenue_summary()` | `REFRESH MATERIALIZED VIEW CONCURRENTLY` (no read blocking). Postgres doesn't store a "last refreshed" time, so **the API records it** when it calls this. |
-| `mv_restaurant_daily_revenue` + `fn_refresh_restaurant_daily_revenue()` | Per restaurant per day `(restaurant_id, revenue_date, order_count, daily_revenue)`. Also concurrent-refreshable. |
+| `SELECT fn_refresh_restaurant_revenue_summary()` | `REFRESH MATERIALIZED VIEW CONCURRENTLY` (no read blocking) **and logs it** in `mv_refresh_log`. |
+| `mv_restaurant_daily_revenue` + `fn_refresh_restaurant_daily_revenue()` | Per restaurant per day `(restaurant_id, revenue_date, order_count, daily_revenue)`. Also concurrent-refreshable and logged. |
+| **`SELECT fn_refresh_all_revenue_views()`** | Refreshes **both** views (each logged) and returns the latest refresh time. Used by the Analytics Refresh button. |
+| `mv_refresh_log` | `(id, view_name, refreshed_at TIMESTAMPTZ, duration_ms, refresh_mode)`, one row per refresh. "Last refreshed" = `MAX(refreshed_at) WHERE view_name = …`. `sql/05` creates it, keeps a compatible existing table, or drops and recreates an incompatible one, then makes sure each view has a logged refresh. |
 | `sql/06_window_analytics.sql` | **Workflow 2.** Last 90 days. Returns `(restaurant_id, revenue_date, daily_revenue, moving_avg_7_day, period_revenue, revenue_rank)`, 90 rows per restaurant. `revenue_rank` = `DENSE_RANK()` by period revenue. Wrap it in a CTE and filter by `restaurant_id` for one restaurant's chart. |
 
 ### 5.2 MongoDB (db name `bitestream`)
@@ -128,30 +131,34 @@ Collection names are **capitalized as in the spec**. Shapes and examples are in 
 |---|---|
 | `Menus` | `{restaurant_id: PG-UUID-string (unique), restaurant_name, location: GeoJSON Point, categories:[{name, items:[{item_id, name, description, price, available, customization_addons?, dietary_tags?}]}], updated_at}`. One per PG restaurant (200). |
 | `Reviews` | `{restaurant_id: PG-UUID-string, user_id: PG-UUID-string, rating: int 1..5, comment, sentiment_tags:[string], created_at}`. 110,000. |
-| `DriverPings` | `{driver_id: int 1..2000, active: bool, location: GeoJSON Point [lng, lat], created_at}`. 510,000, **expire 2 h after seeding** (TTL). Re-run `mongo_seeder.py` before demos. |
+| `DriverPings` | `{driver_id: int 1..2000, active: bool, location: GeoJSON Point [lng, lat], created_at}`. 510,000 seeded (expire 2 h after seeding, TTL) **plus live pings**: the `live-pings` service (`data_generation/live_pings.py`) moves 150 drivers and inserts their pings every 5 s. |
 | **Workflow 3** (`mongo/02_workflow3_geonear.js`) | `$geoNear` (near = restaurant's `Menus.location`, `maxDistance: 5000`, `query: {active: true}`) → `$group` by `driver_id` (nearest ping) → `$sort` → `$limit 10`. For the map's **selectable origin**, pass any `[lng, lat]` as `near`. |
 | **Workflow 4** (`mongo/03_workflow4_facet.js`) | `$match {restaurant_id}` → `$facet {rating_distribution, most_frequent_tags, overall_average_rating}`. |
 
 Mongo `restaurant_id` / `user_id` **are the Postgres UUIDs as strings**, so join them in the API.
 
-### 5.3 Not provided by the DB (handled elsewhere)
+### 5.3 Limits and conventions
 
-- **MV "last refreshed" time:** the API stores it when it calls the refresh function.
-- **New pings appearing on the map while polling:** not provided yet. Re-run `mongo_seeder.py` for
-  fresh data. A small live-ping generator script can be added on request (Aditya).
+- **Amounts:** orders and wallet balances fit `DECIMAL(10,2)`, max **₹9,99,99,999.99**. The browser rejects
+  bigger amounts (and top-ups that would push a balance over it). The API returns `400 AMOUNT_TOO_LARGE`, and
+  a database overflow (SQLSTATE `22003`) maps to the same code.
+- **"Last refreshed"** comes from `mv_refresh_log` (in the database, survives API restarts).
+- **Revenue = `DELIVERED` orders only.** Chart and ranking are live; MV totals change on Refresh.
+- **Time zones:** the audit date filter uses whole days in `?tz=` (the browser's IANA zone), falling back to IST.
 
 ### 5.4 Seeding your own machine (Aditya → Vedant)
 
-Full steps: README → "Setup: database". Short version (≈15 s):
+Full steps: README → "Setup (Docker, recommended)". Short version (≈15 s, with `docker compose watch` running):
 
 ```bash
-cp .env.example .env    # set PGUSER/PGPASSWORD
+cp .env.example .env    # PGUSER=postgres / PGPASSWORD=postgres (compose and the seeders both read it)
 python3 -m venv data_generation/.venv && data_generation/.venv/bin/pip install -r data_generation/requirements.txt
-createdb bitestream && for f in sql/0[1-5]*.sql; do psql -v ON_ERROR_STOP=1 -d bitestream -f "$f"; done
-mongosh mongo/01_collections_and_indexes.js
 cd data_generation && .venv/bin/python postgres_seeder.py --clear && .venv/bin/python mongo_seeder.py \
   && .venv/bin/python reviews_seeder.py && .venv/bin/python menus_seeder.py
 ```
+
+Schemas are created by the containers on an empty volume. If your volume predates a change in `sql/`,
+run `docker compose down -v` (then start and seed again) or apply the changed file with `psql -f` in the container.
 
 **Demo fixtures (fixed IDs, identical on every machine):**
 
@@ -179,13 +186,13 @@ Tech is our choice (justify in README). Keep handlers thin: call the procedure, 
 | `GET /api/restaurants/:id` | — | restaurant + menu | `restaurants` + `Menus` |
 | `GET /api/orders?page&limit&status&user_id&restaurant_id` | filters | list | `orders` |
 | `GET /api/orders/:id` | — | detail | `orders` |
-| `POST /api/checkout` | `{user_id, restaurant_id, amount}` | `{order_id, balance_before, balance_after, audit_entry}` or `{error_code, message}` | `CALL sp_execute_checkout` (autocommit) + newest audit row |
+| `POST /api/checkout` | `{user_id, restaurant_id, amount}` | `{order, balance_before, balance_after, audit_entry}` or `{error_code, message, sqlstate}` | `CALL sp_execute_checkout` (autocommit, **no BEGIN**) + `p_order_id` + newest DEBIT row |
 | `POST /api/orders/:id/advance` | — | updated order | `UPDATE orders SET status …` |
-| `GET /api/users/:id/audit?from&to&page` | date range | rows incl. `balance_after` (= running balance) | `wallet_audit_logs` |
+| `GET /api/users/:id/audit?from&to&page&tz` | date range, browser time zone | rows incl. running balance, `timezone` used | `wallet_audit_logs` |
 | `GET /api/analytics/moving-average?restaurant_id` | restaurant | daily series | `06_window_analytics.sql` |
 | `GET /api/analytics/ranking` | — | DENSE_RANK table | `06_window_analytics.sql` |
-| `GET /api/analytics/summary` | — | MV rows + `last_refreshed` | `mv_restaurant_revenue_summary` |
-| `POST /api/analytics/refresh` | — | `{last_refreshed}` | `fn_refresh_restaurant_revenue_summary()` |
+| `GET /api/analytics/summary` | — | MV totals + `last_refreshed` (from `mv_refresh_log`) | `mv_restaurant_daily_revenue` |
+| `POST /api/analytics/refresh` | — | `{last_refreshed}` | `fn_refresh_all_revenue_views()` (both views, logged) |
 | `GET /api/drivers/nearby?lng&lat` | origin | drivers sorted by distance (5 km) | WF3 pipeline |
 | `GET /api/restaurants/:id/reviews/analytics` | — | facet result | WF4 pipeline |
 | `GET /api/restaurants/:id/menu` | — | menu document | `Menus` |
@@ -214,7 +221,7 @@ Design deliverables: users + goals, wireframes, consistent colours/fonts/compone
 Full story, evidence and explanations: [`docs/database_guide.md`](docs/database_guide.md) §8–§9.
 Handover summary: [`docs/handover_note.md`](docs/handover_note.md).
 
-**Environment:** PostgreSQL 18.6 (Homebrew), MongoDB 8.0.34 (official tarball in `~/mongodb-8.0`), Python 3.14 venv. No Docker.
+**Environment:** verified natively on PostgreSQL 18.6 + MongoDB 8.0.34, and on the team's Docker stack (postgres:18-alpine, mongo:7.0.40).
 
 | A1 requirement | Inherited status | Now |
 |---|---|---|
@@ -256,6 +263,12 @@ deleted by TTL within a minute. Seeder took 86 s. WF2 had 100 of 9,000 non-zero 
 | 2026-10-14 | Aditya | `data_generation/postgres_seeder.py` | Live orders via autocommit CALL (procedure commits itself). Refresh both MVs. `VACUUM ANALYZE` at the end. | Follows the procedure change. Index Only Scans. |
 | 2026-10-14 | Aditya | `docs/*`, `performance/*`, `README.md` | ERD, schema map, EXPLAIN evidence + script, handover note, database guide, README DB sections | Missing A1 / A1B deliverables |
 | 2026-10-14 | Aditya | `AI.md` | Rewritten: contract FROZEN, no Docker, new procedure contract | Keep the team in sync |
+| 2026-10-14 | Aditya | `api/main.py` | Checkout calls the procedure in autocommit (no `BEGIN`) and uses `p_order_id` | Every checkout failed with `2D000 invalid transaction termination` |
+| 2026-10-14 | Aditya | `sql/05_materialized_views.sql` | `mv_refresh_log` (create / keep / replace after schema check), logged refresh functions, `fn_refresh_all_revenue_views()` | "Last refreshed" was lost on every API restart |
+| 2026-10-14 | Aditya | `data_generation/live_pings.py`, `docker-compose.yaml` (`live-pings` service) | Live moving driver pings every 5 s | Map went empty 30 min after seeding; A1B wants new pings while polling |
+| 2026-10-14 | Aditya | `api/main.py`, `api/errors.py`, `web/src` | Amount limit checks (browser + API + `22003` mapping), audit `?tz=` with IST fallback, Refresh updates both views, Analytics hint text | Huge amounts gave a 500; audit days were UTC; summary view never refreshed from UI |
+| 2026-10-14 | Aditya | `api/tests/`, `web/tests/` | 11 API tests (checkout success/failures, limits, refresh log, tz, map) + 5 web tests | A1B asks for tests; `api/tests` was missing |
+| 2026-10-14 | Aditya | `README.md`, `AI.md`, `docs/` | Docker setup, tests, new contract items | Docs said "no Docker" |
 
 ---
 
@@ -267,8 +280,8 @@ deleted by TTL within a minute. Seeder took 86 s. WF2 had 100 of 9,000 non-zero 
 - [ ] `docs/design/`: users, wireframes, style guide
 - [ ] All 4 workflows + browse working through the UI, with meaningful failure messages
 - [ ] A few thoughtful tests (at least: checkout success, insufficient balance, active-order conflict)
-- [ ] README setup works on a fresh clone **without Docker** (each of us tests the others' steps once)
-- [ ] Delete the empty `docker-compose.yaml` files (root, `api/`, `web/`)
-- [ ] Re-run `mongo_seeder.py` right before the demo (pings expire after 2 h)
+- [ ] README setup works on a fresh clone with `docker compose watch` + seeding (each of us tests it once)
+- [x] API tests (`api/tests/`) and web tests (`web/tests/`) pass
+- [ ] Before the demo: `docker compose ps` shows `live-pings` running (the map needs fresh pings)
 - [ ] Moodle: **one** zip named exactly `9_a1b.zip`, < 20 MB, no `node_modules`/`.venv`/`__pycache__`/build/dumps
 - [ ] Everyone has rehearsed the demo and can explain the inherited DB code (viva = 25 marks)

@@ -410,17 +410,25 @@ def main():
                 conn.commit()
 
             # 4. Refresh Materialized Views (if present)
-            for view in ("mv_restaurant_revenue_summary", "mv_restaurant_daily_revenue"):
-                try:
-                    cursor.execute("SELECT to_regclass(%s);", (f"public.{view}",))
-                    if cursor.fetchone()[0]:
-                        logger.info(f"Refreshing materialized view '{view}'...")
-                        cursor.execute(f"REFRESH MATERIALIZED VIEW {view};")
-                        conn.commit()
-                        logger.info(f"✓ Materialized view '{view}' refreshed.")
-                except Exception as e:
-                    conn.rollback()
-                    logger.warning(f"Could not refresh materialized view {view}: {e}")
+            try:
+                # Refreshes both views and records each refresh in mv_refresh_log (sql/05).
+                logger.info("Refreshing materialized views (fn_refresh_all_revenue_views)...")
+                cursor.execute("SELECT fn_refresh_all_revenue_views();")
+                conn.commit()
+                logger.info("✓ Materialized views refreshed and logged in mv_refresh_log.")
+            except psycopg2.errors.UndefinedFunction:
+                conn.rollback()  # older schema without the refresh log: plain refresh
+                for view in ("mv_restaurant_revenue_summary", "mv_restaurant_daily_revenue"):
+                    try:
+                        cursor.execute("SELECT to_regclass(%s);", (f"public.{view}",))
+                        if cursor.fetchone()[0]:
+                            logger.info(f"Refreshing materialized view '{view}'...")
+                            cursor.execute(f"REFRESH MATERIALIZED VIEW {view};")
+                            conn.commit()
+                            logger.info(f"✓ Materialized view '{view}' refreshed.")
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning(f"Could not refresh materialized view {view}: {e}")
 
             # 5. Update planner statistics and the visibility map (needed for Index Only Scans)
             conn.commit()

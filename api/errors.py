@@ -18,6 +18,9 @@ def map_pg_error(exc: psycopg.Error) -> ApiError:
 
     if state == "22023":
         return ApiError(400, "INVALID_AMOUNT", "The order amount must be greater than zero.", state)
+    if state == "22003":  # numeric_value_out_of_range: DECIMAL(10,2) overflow
+        return ApiError(400, "AMOUNT_TOO_LARGE",
+                        "The amount is too large. Orders and wallet balances are limited to ₹9,99,99,999.99.", state)
     if state == "23503":
         return ApiError(404, "NOT_FOUND", "That user or restaurant does not exist.", state)
     if state == "23505":

@@ -361,9 +361,27 @@ unique on `(restaurant_id, revenue_date)`, with its own `fn_refresh_restaurant_d
 Useful for daily charts. The original team built this *instead of* the spec view. We kept it
 and added the spec one.
 
-*Not tracked:* Postgres doesn't record when an MV was last refreshed. The A1B UI needs a "last
-refreshed" time, which the API records when it calls the refresh function (or a small
-`mv_refresh_log` table could be added).
+**"Last refreshed": the `mv_refresh_log` table.** Postgres doesn't record when an MV was last
+refreshed, but the A1B UI must show it. At first the API kept the time in memory, so it vanished on
+every API restart (which, with Docker's `--reload`, happens on every code change). Now the
+database records it:
+
+- `mv_refresh_log (id, view_name, refreshed_at, duration_ms, refresh_mode)`: one row per refresh.
+- Both refresh functions write a row after `REFRESH … CONCURRENTLY`, timing it with
+  `clock_timestamp()`. (`NOW()` would return the *transaction start* time, the same value for every
+  statement in the transaction.) The log row is written in the **same transaction** as the refresh, so
+  it can't claim a refresh that rolled back.
+- `fn_refresh_all_revenue_views()` refreshes both views and returns the latest time. The Analytics
+  Refresh button calls it.
+- "Last refreshed" = `SELECT MAX(refreshed_at) FROM mv_refresh_log WHERE view_name = …` (indexed on
+  `(view_name, refreshed_at DESC)`).
+- **Defensive install:** a `DO` block in `sql/05` checks whether a table with that name already exists.
+  It keeps it (and its rows) only if it is a real table with the required columns and types (`id`
+  auto-generated, `view_name` text, `refreshed_at` timestamptz) and no unknown `NOT NULL` column without
+  a default. Otherwise (wrong type, a view squatting on the name, an id that isn't auto-generated) it
+  drops and recreates it. Missing optional columns are added. Finally, any view without a logged
+  refresh is refreshed once, so the first "last refreshed" time is real rather than invented. All
+  seven cases were tested in a scratch database.
 
 ### 4.6 Workflow 2: window analytics (`sql/06_window_analytics.sql`)
 
@@ -486,8 +504,17 @@ this caps the collection's size without any cron job.
 **The bug we found:** the inherited seeder stamped pings with random times up to **4 hours** in
 the past. Within a minute of seeding, the TTL monitor deleted **251,609 of 500,000 (50.3%)**,
 leaving 248,391, below the spec's 500k. Fixed by stamping pings within the last 10 minutes.
-Consequence to remember: **all seeded pings vanish ~2 h after seeding**, so re-run
-`mongo_seeder.py` before a demo.
+Consequence: **all seeded pings vanish ~2 h after seeding**, and the API's map only shows pings
+from the last 30 minutes. So the map emptied half an hour after seeding.
+
+**Live pings (`data_generation/live_pings.py`, the `live-pings` compose service).** It simulates
+150 drivers on the road. They start near restaurants (locations from `Menus`, 15% around the demo
+restaurant), and every 5 s each one moves 40–125 m, mostly keeping its heading, occasionally going
+on/off duty. Each round is inserted as new GeoJSON pings with `created_at = now`. That is about 108k
+pings/hour, and the TTL index keeps the collection bounded (~216k live pings at steady state). The map
+polls every 10 s, so drivers visibly move. This is what A1B means by "new pings should appear without
+a full page reload". It also shows why a TTL index is the right tool: the collection never needs
+manual cleanup.
 
 ### 5.4 Workflow 3: nearest active drivers (`mongo/02_workflow3_geonear.js`)
 
@@ -654,6 +681,25 @@ consistent.
 **What I deliberately did not change:** the table definitions, the trigger, the partial index,
 the WF2 query and the WF4 pipeline. They already met the spec, and changing working code
 without a reason only adds risk. I also kept the inherited daily MV.
+
+### 8.1 After the handover: integration problems found by end-to-end testing
+
+Once the API and UI existed, I tested every endpoint and screen against the database. These were
+found and fixed on branch `aditya/verification-fixes`:
+
+| Problem | Root cause | Fix |
+|---|---|---|
+| **Every checkout failed** ("Something went wrong in the database"), even ₹420 with ₹500 in the wallet | The API wrapped the call in `BEGIN ISOLATION LEVEL REPEATABLE READ … CALL …`, but the procedure now COMMITs itself (A1 spec). Postgres rejects that with `2D000 invalid transaction termination` *before* the balance is even checked. It only "worked" on a teammate's machine whose Docker volume still had the old procedure. | The API calls the procedure in autocommit mode and uses the returned `p_order_id`. Balance before/after comes from the new audit row. **Lesson:** a database contract change must be pushed to every caller, and init scripts only run on a fresh volume. |
+| Map empty 30 min after seeding, never any new pings | Seeded pings share one time window. Nothing produced live data. | `live_pings.py` as a compose service (§5.3) |
+| "Last refreshed" lost on API restart | Kept in API memory | `mv_refresh_log` (§4.5) |
+| Refresh button only refreshed the per-day view | — | `fn_refresh_all_revenue_views()` refreshes and logs both |
+| A huge amount returned a 500 | `DECIMAL(10,2)` overflow (SQLSTATE `22003`) wasn't mapped | Checked in three layers: the browser (also "would this top-up push the balance over the limit?"), the API (400 `AMOUNT_TOO_LARGE`), and the database error mapping. The browser deliberately does **not** pre-check "amount > balance": that failure must come from the procedure so the UI can demonstrate it. |
+| Audit date filter used UTC days while the UI shows IST | Day boundaries built in UTC | The browser sends its IANA time zone (`?tz=`). The API validates it with `zoneinfo` and falls back to IST. |
+| "My 1-crore order isn't in total revenue" | Not a bug: revenue counts DELIVERED orders only, and the summary is a materialized-view snapshot until Refresh | One-line hint on the Analytics page |
+
+All of it is covered by tests: `api/tests/` (11 pytest tests against the real database: checkout
+success and each failure, amount limits, the refresh log, time zones, the map) and `web/tests/`
+(17 node tests).
 
 ---
 
@@ -838,6 +884,20 @@ FROM c;
 26. **How did you make the data reproducible for teammates?** A fixed seed for all randomness,
     including UUIDs, fixed-ID demo fixtures, configuration through `.env`, one documented command
     sequence, and expected counts to compare against.
+27. **Tell me about a bug you found in integration.** Checkout failed for every order. I traced it
+    in the backend logs to `2D000 invalid transaction termination`: I had made the procedure own its
+    transaction (as the spec requires), but the API still opened its own `BEGIN` first, and a procedure
+    can't COMMIT inside a caller's transaction block. It passed on one machine because Docker only runs
+    init scripts on an empty volume, so that database still had the old procedure. I reproduced it with
+    the API's exact statements in psql, fixed the API to call in autocommit mode, and added tests for
+    success and each failure.
+28. **How do you show "last refreshed" for a materialized view?** Postgres doesn't store it, so the
+    refresh functions insert into a log table in the same transaction as the refresh, using
+    `clock_timestamp()` (not `NOW()`, which is the transaction start). The UI reads the max per view.
+29. **Why validate amounts in the browser if the database enforces them anyway?** Defence in depth
+    and a better experience: the browser gives an instant, specific message; the API rejects bad
+    input before it costs a database round trip; the database is the final guarantee. But business
+    failures we want to *demonstrate* (insufficient balance) are left to the database on purpose.
 
 ---
 
@@ -848,13 +908,13 @@ FROM c;
   writes explicit CREDIT rows. A user-creation procedure could do the same.
 - **No `drivers` table.** `driver_id` exists only in Mongo. A real system would have a drivers
   table in Postgres.
-- **MV "last refreshed" time isn't stored.** It could be added with an `mv_refresh_log` table
-  written by the refresh functions.
-- **Seeded pings expire 2 h after seeding.** A small live-ping generator would keep the map
-  populated during demos.
+- ~~MV "last refreshed" time isn't stored.~~ Solved with `mv_refresh_log` (§4.5).
+- ~~Seeded pings expire 2 h after seeding.~~ Solved with the `live-pings` service (§5.3).
 - **WF2's window is relative to `CURRENT_DATE`.** Fine for live data, but results shift day to
   day. A date parameter would make it reproducible.
-- **Day boundaries depend on the session time zone** (§4.6). Set `Asia/Kolkata` in the API.
+- **Day boundaries in WF2 and the MVs use the database session time zone** (UTC in Docker), so a
+  delivery at 00:30 IST counts on the previous day in the chart. The audit filter is already
+  time-zone aware. `ALTER DATABASE bitestream SET timezone = 'Asia/Kolkata'` would align the rest.
 - **The procedure's calling contract** (autocommit only) must be respected by every client.
 - **Historical orders are bulk-inserted, not created through the procedure** (they need
   backdated timestamps). Only the 300 live orders exercise the procedure and trigger.
